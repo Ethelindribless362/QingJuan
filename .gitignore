@@ -27,3 +27,6 @@ debug_masks/
 debug_masks2/
 .gitignore
 .codex-tmp/
+.claude/
+0012.png
+key.txt

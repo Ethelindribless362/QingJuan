@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -11,6 +11,46 @@ TranslationProvider = Literal["openai", "newapi", "anthropic", "grok2api", "cust
 TaskType = Literal["download", "translate"]
 TaskStatus = Literal["queued", "running", "completed", "failed"]
 TaskLogLevel = Literal["info", "warning", "error"]
+MangaTextDirection = Literal["vertical", "horizontal"]
+MangaRegionShape = Literal["ellipse", "roundrect", "rect"]
+MangaRenderMode = Literal["ocr_pipeline", "image_edit_fallback"]
+
+
+class MangaOcrRegion(BaseModel):
+    order: int = 0
+    bbox: tuple[int, int, int, int] | None = None
+    body_bbox: tuple[int, int, int, int] | None = None
+    safe_box: tuple[int, int, int, int] | None = None
+    source_text: str = ""
+    source_direction: MangaTextDirection | None = None
+    direction: MangaTextDirection | None = None
+    background: str | None = None
+    text_color: str | None = None
+    shape: MangaRegionShape | None = None
+    padding_ratio: float | None = None
+
+
+class MangaOcrPagePayload(BaseModel):
+    page_number: int = 0
+    image_size: tuple[int, int] | None = None
+    regions: list[MangaOcrRegion] = Field(default_factory=list)
+    diagnostics: dict[str, Any] | None = None
+
+
+class MangaTranslatedRegion(MangaOcrRegion):
+    translation: str = ""
+
+
+class MangaTranslatedPagePayload(BaseModel):
+    page_number: int = 0
+    image_size: tuple[int, int] | None = None
+    target_language: str = ""
+    render_mode: MangaRenderMode = "ocr_pipeline"
+    source_image_file: str | None = None
+    translated_image_file: str | None = None
+    page_translation: str = ""
+    regions: list[MangaTranslatedRegion] = Field(default_factory=list)
+    diagnostics: dict[str, Any] | None = None
 
 
 class AddBookPayload(BaseModel):

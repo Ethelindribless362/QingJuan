@@ -32,7 +32,30 @@ import httpx
 from bs4 import BeautifulSoup
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, UnidentifiedImageError
 
-from .models import AddBookPayload, ChapterPreview, PreviewResponse, TranslationSettings
+try:
+    from .db import DATA_DIR
+    from .models import (
+        AddBookPayload,
+        ChapterPreview,
+        MangaOcrPagePayload,
+        MangaOcrRegion,
+        MangaTranslatedPagePayload,
+        MangaTranslatedRegion,
+        PreviewResponse,
+        TranslationSettings,
+    )
+except ImportError:
+    from app.db import DATA_DIR
+    from app.models import (
+        AddBookPayload,
+        ChapterPreview,
+        MangaOcrPagePayload,
+        MangaOcrRegion,
+        MangaTranslatedPagePayload,
+        MangaTranslatedRegion,
+        PreviewResponse,
+        TranslationSettings,
+    )
 
 try:
     from curl_cffi import requests as curl_requests
@@ -174,7 +197,7 @@ BIKA_SIGNATURE_SUFFIX = "C69BAF41DA5ABD1FFEDC6D2FEA56B"
 BIKA_SIGNATURE_KEY = "~d}$Q7$eIni=V)9\\RK/P.RM4;9[7|@/CA}b~OW!3?EV`:<>M7pddUBL5n|0/*Cn"
 _BIKA_TOKEN_CACHE: dict[str, str] = {}
 _COMIC_18_SCRAMBLE_ID_CACHE: dict[str, int] = {}
-MANGA_RENDERER_VERSION = 5
+MANGA_RENDERER_VERSION = 8
 
 @dataclass
 class DownloadResult:
@@ -1075,12 +1098,33 @@ def _load_translated_page_metadata(book_dir: Path, filename: str) -> dict[str, A
     return payload if isinstance(payload, dict) else {}
 
 
+def _load_translated_page_payload_models(book_dir: Path, filename: str) -> list[MangaTranslatedPagePayload]:
+    payload = _load_translated_page_metadata(book_dir, filename)
+    translated_pages = payload.get("translated_pages")
+    if not isinstance(translated_pages, list):
+        return []
+
+    parsed_pages: list[MangaTranslatedPagePayload] = []
+    for item in translated_pages:
+        if not isinstance(item, dict):
+            continue
+        try:
+            parsed_pages.append(MangaTranslatedPagePayload.model_validate(item))
+        except Exception:
+            continue
+    return parsed_pages
+
+
 def load_translated_page_payload(book_dir: Path, filename: str) -> list[str]:
     payload = _load_translated_page_metadata(book_dir, filename)
     page_translations = payload.get("page_translations")
-    if not isinstance(page_translations, list):
-        return []
-    return [str(item).strip() for item in page_translations if isinstance(item, str)]
+    if isinstance(page_translations, list):
+        return [str(item).strip() for item in page_translations if isinstance(item, str)]
+    return [
+        page.page_translation.strip()
+        for page in _load_translated_page_payload_models(book_dir, filename)
+        if page.page_translation.strip()
+    ]
 
 
 def translated_image_payload_is_current(book_dir: Path, filename: str) -> bool:
@@ -1097,19 +1141,98 @@ def save_translated_page_payload(
     filename: str,
     page_translations: list[str],
     translated_image_files: list[str] | None = None,
+    translated_pages: list[MangaTranslatedPagePayload] | None = None,
 ) -> str:
+    resolved_page_translations = [str(item).strip() for item in page_translations if str(item).strip()]
+    resolved_translated_image_files = [str(item).strip() for item in (translated_image_files or []) if str(item).strip()]
+    if translated_pages and not resolved_page_translations:
+        resolved_page_translations = [
+            page.page_translation.strip()
+            for page in translated_pages
+            if page.page_translation.strip()
+        ]
+    if translated_pages and not resolved_translated_image_files:
+        resolved_translated_image_files = [
+            str(page.translated_image_file or "").strip()
+            for page in translated_pages
+            if str(page.translated_image_file or "").strip()
+        ]
+
     target_path = translated_meta_path(book_dir, filename)
     payload: dict[str, Any] = {
-        "page_translations": page_translations,
+        "page_translations": resolved_page_translations,
         "renderer_version": MANGA_RENDERER_VERSION,
     }
-    if translated_image_files:
-        payload["translated_image_files"] = translated_image_files
+    if translated_image_files is not None:
+        payload["translated_image_files"] = resolved_translated_image_files
+    if translated_pages is not None:
+        payload["translated_pages"] = [
+            page.model_dump(mode="python", exclude_none=True)
+            for page in translated_pages
+        ]
+        payload["page_count"] = len(translated_pages)
+        if translated_pages:
+            payload["target_language"] = translated_pages[0].target_language
     target_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return target_path.name
+
+
+async def translate_single_manga_image(
+    *,
+    image_bytes: bytes,
+    original_name: str,
+    target_language: str,
+    settings: TranslationSettings,
+    title: str = "单图翻译",
+    log_callback: Callable[[str, str], Awaitable[None] | None] | None = None,
+) -> tuple[bytes, str]:
+    if not image_bytes:
+        raise ValueError("漫画图片文件为空")
+
+    safe_name = Path(original_name or "upload.png").name
+    fallback_extension = Path(safe_name).suffix.lower() or ".png"
+    extension = _image_extension_from_bytes(image_bytes, fallback_extension)
+    workspace_dir = DATA_DIR / "tmp" / "image-translate" / f"image-{secrets.token_hex(8)}"
+    workspace_dir.mkdir(parents=True, exist_ok=False)
+
+    try:
+        source_asset_path = f"images/0001-01-upload{extension}"
+        source_image_path = workspace_dir / source_asset_path
+        source_image_path.parent.mkdir(parents=True, exist_ok=True)
+        source_image_path.write_bytes(image_bytes)
+
+        page_translations, translated_image_files, translated_pages = await _translate_manga_pages_with_command_detailed(
+            settings=settings,
+            target_language=target_language,
+            chapter_index=1,
+            title=title.strip() or Path(safe_name).stem or "单图翻译",
+            image_files=[source_asset_path],
+            book_dir=workspace_dir,
+            log_callback=log_callback,
+        )
+        if not translated_image_files:
+            raise RuntimeError("漫画单图翻译未生成输出图片")
+
+        translated_image_path = (workspace_dir / translated_image_files[0]).resolve()
+        if not translated_image_path.exists() or not translated_image_path.is_file():
+            raise RuntimeError(f"漫画单图翻译输出不存在：{translated_image_files[0]}")
+
+        translated_bytes = _ensure_png_image_bytes(translated_image_path.read_bytes())
+        page_translation = page_translations[0].strip() if page_translations else ""
+        if translated_pages:
+            await _emit_single_image_diagnostics(
+                log_callback=log_callback,
+                page_payload=translated_pages[0],
+                source_name=safe_name,
+                target_language=target_language,
+                trace_id=workspace_dir.name,
+            )
+        return translated_bytes, page_translation
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 async def download_selected_chapters(
@@ -1276,7 +1399,7 @@ async def translate_selected_chapters(
             translated_meta_filename = build_translated_meta_filename(filename)
             source_title = str(chapter.get("title") or f"第{chapter_index}章")
             repair_18comic_chapter_images(book_dir, manifest, chapter_index)
-            page_translations, translated_image_files = await _translate_manga_pages_with_command(
+            page_translations, translated_image_files, translated_pages = await _translate_manga_pages_with_command_detailed(
                 settings=settings,
                 target_language=language,
                 chapter_index=chapter_index,
@@ -1286,7 +1409,13 @@ async def translate_selected_chapters(
                 log_callback=log_callback,
             )
             translated_text = _merge_page_translations(source_title, page_translations)
-            save_translated_page_payload(book_dir, filename, page_translations, translated_image_files)
+            save_translated_page_payload(
+                book_dir,
+                filename,
+                page_translations,
+                translated_image_files,
+                translated_pages=translated_pages,
+            )
             chapter["translated_meta_file_name"] = translated_meta_filename
             chapter["translated_image_files"] = translated_image_files
             chapter["translated"] = True
@@ -1377,6 +1506,9 @@ def _resolve_manga_image_provider_config(
         base_url = "https://api.openai.com/v1"
     if not base_url:
         raise ValueError("漫画译图接口地址未配置")
+    base_host = (urlparse(base_url).hostname or "").lower()
+    if base_host in {"example.com", "www.example.com", "your-newapi-endpoint"}:
+        raise ValueError("漫画译图接口地址仍是占位值，请先在设置中填写真实 API 地址")
     if not api_key:
         raise ValueError("漫画译图 API 密钥未配置")
     if not configured_model:
@@ -1553,6 +1685,121 @@ def _normalize_region_bbox(raw_bbox: Any, image_size: tuple[int, int]) -> tuple[
     return x1, y1, x2, y2
 
 
+def _intersect_region_bboxes(
+    left: tuple[int, int, int, int] | None,
+    right: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return x1, y1, x2, y2
+
+
+def _bbox_area(bbox: tuple[int, int, int, int] | None) -> int:
+    if bbox is None:
+        return 0
+    return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def _bbox_iou(
+    left: tuple[int, int, int, int] | None,
+    right: tuple[int, int, int, int] | None,
+) -> float:
+    if left is None or right is None:
+        return 0.0
+    overlap = _intersect_region_bboxes(left, right)
+    if overlap is None:
+        return 0.0
+    overlap_area = _bbox_area(overlap)
+    if overlap_area <= 0:
+        return 0.0
+    union = _bbox_area(left) + _bbox_area(right) - overlap_area
+    if union <= 0:
+        return 0.0
+    return overlap_area / union
+
+
+def _manga_region_identity_key(region: MangaOcrRegion) -> tuple[str, str]:
+    normalized_text = re.sub(r"\s+", "", str(region.source_text or "")).strip().lower()
+    direction = str(region.direction or region.source_direction or "").strip().lower()
+    return normalized_text, direction
+
+
+def _manga_region_rank(region: MangaOcrRegion) -> tuple[int, int]:
+    richness = 0
+    if region.safe_box is not None:
+        richness += 3
+    if region.body_bbox is not None:
+        richness += 2
+    if region.direction is not None:
+        richness += 1
+    if region.shape is not None:
+        richness += 1
+    if region.background is not None:
+        richness += 1
+    if region.text_color is not None:
+        richness += 1
+    return richness, -_bbox_area(region.body_bbox or region.bbox)
+
+
+def _dedupe_manga_ocr_regions(regions: list[MangaOcrRegion]) -> tuple[list[MangaOcrRegion], int]:
+    deduped: list[MangaOcrRegion] = []
+    dropped_count = 0
+    for region in regions:
+        region_key = _manga_region_identity_key(region)
+        duplicate_index: int | None = None
+        for index, existing in enumerate(deduped):
+            if region_key != _manga_region_identity_key(existing):
+                continue
+            overlap = _bbox_iou(existing.body_bbox or existing.bbox, region.body_bbox or region.bbox)
+            if overlap < 0.72:
+                overlap = _bbox_iou(existing.bbox, region.bbox)
+            if overlap >= 0.72:
+                duplicate_index = index
+                break
+        if duplicate_index is None:
+            deduped.append(region)
+            continue
+        dropped_count += 1
+        if _manga_region_rank(region) > _manga_region_rank(deduped[duplicate_index]):
+            deduped[duplicate_index] = region
+    return deduped, dropped_count
+
+
+def _normalize_region_box_within(
+    raw_bbox: Any,
+    image_size: tuple[int, int],
+    limit_bbox: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int] | None:
+    normalized = _normalize_region_bbox(raw_bbox, image_size)
+    if normalized is None:
+        return None
+    if limit_bbox is None:
+        return normalized
+    return _intersect_region_bboxes(normalized, limit_bbox)
+
+
+def _shrink_absolute_bbox(
+    bbox: tuple[int, int, int, int],
+    inset_x: int,
+    inset_y: int,
+) -> tuple[int, int, int, int] | None:
+    x1, y1, x2, y2 = bbox
+    resolved_x = max(0, int(inset_x))
+    resolved_y = max(0, int(inset_y))
+    shrunk = (x1 + resolved_x, y1 + resolved_y, x2 - resolved_x, y2 - resolved_y)
+    if shrunk[2] - shrunk[0] < 8 or shrunk[3] - shrunk[1] < 8:
+        return None
+    return shrunk
+
+
 def _parse_hex_color(value: Any) -> tuple[int, int, int] | None:
     text_value = str(value or "").strip()
     if not re.fullmatch(r"#?[0-9a-fA-F]{6}", text_value):
@@ -1561,10 +1808,21 @@ def _parse_hex_color(value: Any) -> tuple[int, int, int] | None:
     return tuple(int(normalized[index : index + 2], 16) for index in (0, 2, 4))
 
 
+def _average_rgb_pixels(pixels: list[tuple[int, int, int]]) -> tuple[int, int, int]:
+    if not pixels:
+        return (255, 255, 255)
+    red = sum(int(item[0]) for item in pixels) // len(pixels)
+    green = sum(int(item[1]) for item in pixels) // len(pixels)
+    blue = sum(int(item[2]) for item in pixels) // len(pixels)
+    return red, green, blue
+
+
 def _sample_region_fill_color(
     image: Image.Image,
     bbox: tuple[int, int, int, int],
     preferred_color: Any = None,
+    *,
+    body_bbox: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int]:
     parsed = _parse_hex_color(preferred_color)
     if parsed is not None:
@@ -1572,9 +1830,27 @@ def _sample_region_fill_color(
 
     width, height = image.size
     x1, y1, x2, y2 = bbox
+    sample_bbox = body_bbox or bbox
     padding = max(2, min((x2 - x1) // 8, (y2 - y1) // 8, 12))
     pixels: list[tuple[int, int, int]] = []
     rgb_image = image.convert("RGB")
+
+    center_inset_x = max(1, min(12, (sample_bbox[2] - sample_bbox[0]) // 7))
+    center_inset_y = max(1, min(12, (sample_bbox[3] - sample_bbox[1]) // 7))
+    center_bbox = _shrink_absolute_bbox(sample_bbox, center_inset_x, center_inset_y)
+    if center_bbox is not None:
+        interior_pixels = list(rgb_image.crop(center_bbox).getdata())
+        if interior_pixels:
+            high_luminance_pixels = [
+                color for color in interior_pixels if _color_luminance(color) >= 176 and _color_saturation(color) <= 72
+            ]
+            low_luminance_pixels = [
+                color for color in interior_pixels if _color_luminance(color) <= 104 and _color_saturation(color) <= 96
+            ]
+            if len(low_luminance_pixels) >= max(16, len(interior_pixels) // 5):
+                return _average_rgb_pixels(low_luminance_pixels[: min(96, len(low_luminance_pixels))])
+            if len(high_luminance_pixels) >= max(16, len(interior_pixels) // 5):
+                return _average_rgb_pixels(high_luminance_pixels[: min(96, len(high_luminance_pixels))])
 
     def append_strip(left: int, top: int, right: int, bottom: int) -> None:
         crop = rgb_image.crop((max(0, left), max(0, top), min(width, right), min(height, bottom)))
@@ -1588,10 +1864,7 @@ def _sample_region_fill_color(
     if not pixels:
         return (255, 255, 255)
 
-    red = sum(color[0] for color in pixels) // len(pixels)
-    green = sum(color[1] for color in pixels) // len(pixels)
-    blue = sum(color[2] for color in pixels) // len(pixels)
-    return red, green, blue
+    return _average_rgb_pixels(pixels)
 
 
 def _resolve_text_color(fill_color: tuple[int, int, int], preferred_color: Any = None) -> tuple[int, int, int]:
@@ -1709,6 +1982,145 @@ def _normalize_vertical_text(text: str) -> str:
     return "".join(normalized_chars)
 
 
+LAYOUT_NO_LINE_START = set("，。、！？；：)]）】》」』〉”’%,.!?;:")
+LAYOUT_NO_LINE_END = set("([（【《「『〈“‘$￥")
+
+
+def _is_ascii_word_character(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char in {"'", "-", "_", "/", ".", "+", "%", "&"})
+
+
+def _text_supports_vertical_layout(text: str) -> bool:
+    content = re.sub(r"\s+", "", str(text or ""))
+    if not content:
+        return False
+    if re.search(r"[A-Za-z]{3,}", content):
+        return False
+    if re.search(r"\d{3,}", content):
+        return False
+    if re.search(r"[A-Za-z0-9][./:+-][A-Za-z0-9]", content):
+        return False
+    ascii_dense = len(re.findall(r"[A-Za-z0-9]", content))
+    return ascii_dense <= max(3, len(content) // 5)
+
+
+def _tokenize_layout_text(text: str) -> list[str]:
+    content = str(text or "")
+    if not content:
+        return []
+
+    tokens: list[str] = []
+    buffer: list[str] = []
+
+    def flush_buffer() -> None:
+        if buffer:
+            tokens.append("".join(buffer))
+            buffer.clear()
+
+    for raw_char in content:
+        if raw_char.isspace():
+            flush_buffer()
+            if tokens and tokens[-1] != " ":
+                tokens.append(" ")
+            continue
+        if _is_ascii_word_character(raw_char):
+            buffer.append(raw_char)
+            continue
+        flush_buffer()
+        tokens.append(raw_char)
+    flush_buffer()
+    return tokens
+
+
+def _join_layout_tokens(tokens: list[str]) -> str:
+    return "".join(tokens).strip()
+
+
+def _measure_text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    value = str(text or "").strip()
+    if not value:
+        return 0
+    bbox = draw.textbbox((0, 0), value, font=font)
+    return max(0, bbox[2] - bbox[0])
+
+
+def _line_break_penalty(
+    left_text: str,
+    right_text: str,
+    *,
+    line_width: int,
+    max_width: int,
+) -> float:
+    penalty = abs(max_width - line_width) / max(12, max_width)
+    if left_text and left_text[-1] in LAYOUT_NO_LINE_END:
+        penalty += 6.0
+    if right_text and right_text[0] in LAYOUT_NO_LINE_START:
+        penalty += 6.0
+    if len(left_text) <= 1:
+        penalty += 1.5
+    return penalty
+
+
+def _select_wrap_break_index(
+    draw: ImageDraw.ImageDraw,
+    tokens: list[str],
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> int:
+    if len(tokens) <= 1:
+        return 1
+
+    candidates: list[tuple[float, float, int, int]] = []
+    for index in range(1, len(tokens)):
+        left_text = _join_layout_tokens(tokens[:index]).rstrip()
+        right_text = _join_layout_tokens(tokens[index:]).lstrip()
+        if not left_text:
+            continue
+        line_width = _measure_text_width(draw, left_text, font)
+        penalty = _line_break_penalty(
+            left_text,
+            right_text,
+            line_width=line_width,
+            max_width=max_width,
+        )
+        if line_width > max_width * 1.08:
+            penalty += 4.0
+        if tokens[index - 1] == " " or tokens[index] == " ":
+            penalty -= 0.35
+        candidates.append((penalty, abs(max_width - line_width), -len(left_text), index))
+
+    if candidates:
+        return min(candidates)[-1]
+    return max(1, len(tokens) - 1)
+
+
+def _horizontal_layout_penalty(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> float:
+    if not lines:
+        return 8.0
+    line_widths = [_measure_text_width(draw, line, font) for line in lines if line.strip()]
+    if not line_widths:
+        return 8.0
+    widest = max(line_widths)
+    narrowest = min(line_widths)
+    penalty = ((widest - narrowest) / max(12, max_width)) * 1.4
+    if len(line_widths) > 1 and line_widths[-1] < widest * 0.42:
+        penalty += 1.8
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped[0] in LAYOUT_NO_LINE_START:
+            penalty += 2.5
+        if stripped[-1] in LAYOUT_NO_LINE_END:
+            penalty += 2.5
+    return penalty
+
+
 def _measure_text_token(
     draw: ImageDraw.ImageDraw,
     token: str,
@@ -1794,21 +2206,33 @@ def _wrap_text_for_box(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Ima
 
     lines: list[str] = []
     for paragraph in paragraphs:
-        current = ""
-        for raw_char in paragraph:
-            char = " " if raw_char.isspace() else raw_char
-            if not current and char == " ":
+        remaining_tokens = _tokenize_layout_text(paragraph)
+        current_tokens: list[str] = []
+        while remaining_tokens:
+            token = remaining_tokens.pop(0)
+            if not current_tokens and token == " ":
                 continue
-            candidate = f"{current}{char}"
-            bbox = draw.textbbox((0, 0), candidate.rstrip(), font=font)
-            if current and bbox[2] - bbox[0] > max_width:
-                lines.append(current.rstrip())
-                current = "" if char == " " else char
-            else:
-                current = candidate
-        if current:
-            lines.append(current.rstrip())
+            candidate_tokens = current_tokens + [token]
+            candidate_text = _join_layout_tokens(candidate_tokens)
+            candidate_width = _measure_text_width(draw, candidate_text, font)
+            if current_tokens and candidate_width > max_width:
+                break_index = _select_wrap_break_index(draw, candidate_tokens, font, max_width)
+                line_text = _join_layout_tokens(candidate_tokens[:break_index]).strip()
+                if line_text:
+                    lines.append(line_text)
+                remainder_tokens = candidate_tokens[break_index:]
+                while remainder_tokens and remainder_tokens[0] == " ":
+                    remainder_tokens.pop(0)
+                remaining_tokens = remainder_tokens + remaining_tokens
+                current_tokens = []
+                continue
+            current_tokens = candidate_tokens
+        final_line = _join_layout_tokens(current_tokens).strip()
+        if final_line:
+            lines.append(final_line)
     return lines or [str(text or "").strip()]
+
+
 
 
 def _normalize_layout_direction(
@@ -1834,9 +2258,9 @@ def _normalize_layout_direction(
     box_width, box_height = box_size
     aspect_ratio = box_height / max(box_width, 1)
     dense_length = len(re.sub(r"\s+", "", str(text or "")))
-    if aspect_ratio >= 2.2:
+    if aspect_ratio >= 2.2 and _text_supports_vertical_layout(text):
         return "vertical"
-    if aspect_ratio >= 1.45 and dense_length <= 24:
+    if aspect_ratio >= 1.55 and dense_length <= 20 and _text_supports_vertical_layout(text):
         return "vertical"
     return "horizontal"
 
@@ -1851,12 +2275,12 @@ def _build_horizontal_layout_candidate(
     font = _load_local_render_font(font_size)
     lines = _wrap_text_for_box(draw, text, font, max(8, max_width))
     rendered_text = "\n".join(lines)
-    spacing = max(1, min(12, font_size // 5))
+    spacing = max(1, min(10, font_size // 6 + (1 if len(lines) <= 2 else 0)))
     bbox = draw.multiline_textbbox((0, 0), rendered_text, font=font, spacing=spacing, align="center")
     content_width = max(0, bbox[2] - bbox[0])
     content_height = max(0, bbox[3] - bbox[1])
-    safe_width = max_width * 0.94
-    safe_height = max_height * 0.92
+    safe_width = max_width * 0.90
+    safe_height = max_height * 0.88
     overflow = max(0.0, content_width - safe_width) + max(0.0, content_height - safe_height)
     return {
         "direction": "horizontal",
@@ -1868,6 +2292,7 @@ def _build_horizontal_layout_candidate(
         "content_height": content_height,
         "fits": content_width <= safe_width and content_height <= safe_height,
         "overflow": overflow,
+        "layout_penalty": _horizontal_layout_penalty(draw, lines, font, max_width),
     }
 
 
@@ -1909,16 +2334,25 @@ def _build_vertical_layout_candidate(
 ) -> dict[str, Any]:
     max_width, max_height = box_size
     font = _load_local_render_font(font_size)
-    char_gap = max(1, min(6, font_size // 8))
-    column_gap = max(2, min(12, font_size // 4))
+    char_gap = max(1, min(5, font_size // 10 + 1))
+    column_gap = max(2, min(10, font_size // 5))
     columns = _build_vertical_columns(draw, text, font, max(8, max_height), char_gap)
     content_width = sum(int(column.get("width") or 0) for column in columns)
     if len(columns) > 1:
         content_width += column_gap * (len(columns) - 1)
     content_height = max((int(column.get("height") or 0) for column in columns), default=0)
-    safe_width = max_width * 0.92
-    safe_height = max_height * 0.92
+    safe_width = max_width * 0.90
+    safe_height = max_height * 0.88
     overflow = max(0.0, content_width - safe_width) + max(0.0, content_height - safe_height)
+    column_heights = [int(column.get("height") or 0) for column in columns]
+    tallest = max(column_heights, default=0)
+    shortest = min(column_heights, default=0)
+    vertical_penalty = 0.0
+    if tallest > 0:
+        vertical_penalty += ((tallest - shortest) / tallest) * 2.2
+    vertical_penalty += max(0, len(columns) - 2) * 0.9
+    if not _text_supports_vertical_layout(text):
+        vertical_penalty += 3.5
     return {
         "direction": "vertical",
         "font": font,
@@ -1930,7 +2364,28 @@ def _build_vertical_layout_candidate(
         "content_height": content_height,
         "fits": bool(columns) and content_width <= safe_width and content_height <= safe_height,
         "overflow": overflow,
+        "layout_penalty": vertical_penalty,
     }
+
+
+def _layout_score_tuple(layout: dict[str, Any], box_size: tuple[int, int]) -> tuple[int, float, float, int]:
+    box_width, box_height = box_size
+    content_width = int(layout.get("content_width") or 0)
+    content_height = int(layout.get("content_height") or 0)
+    overflow = float(layout.get("overflow") or 0.0)
+    fill_ratio = max(
+        content_width / max(1, box_width),
+        content_height / max(1, box_height),
+    )
+    edge_penalty = max(0.0, fill_ratio - 0.84) * 12.0
+    underfill_penalty = max(0.0, 0.46 - fill_ratio) * 4.5
+    layout_penalty = float(layout.get("layout_penalty") or 0.0)
+    return (
+        0 if bool(layout.get("fits")) else 1,
+        round(overflow + edge_penalty, 3),
+        round(layout_penalty + underfill_penalty, 3),
+        -int(layout.get("font_size") or 0),
+    )
 
 
 def _fit_text_layout_for_direction(
@@ -1950,14 +2405,7 @@ def _fit_text_layout_for_direction(
             candidate = _build_vertical_layout_candidate(draw, text, box_size, font_size)
         else:
             candidate = _build_horizontal_layout_candidate(draw, text, box_size, font_size)
-        if candidate["fits"]:
-            return candidate
-        if best_layout is None:
-            best_layout = candidate
-            continue
-        candidate_key = (int(candidate["overflow"]), -int(candidate["font_size"]))
-        best_key = (int(best_layout["overflow"]), -int(best_layout["font_size"]))
-        if candidate_key < best_key:
+        if best_layout is None or _layout_score_tuple(candidate, box_size) < _layout_score_tuple(best_layout, box_size):
             best_layout = candidate
 
     if best_layout is not None:
@@ -1975,19 +2423,53 @@ def _fit_text_layout_to_box(
     primary_layout = _fit_text_layout_for_direction(text, box_size, preferred)
     alternate_direction = "horizontal" if preferred == "vertical" else "vertical"
     alternate_layout = _fit_text_layout_for_direction(text, box_size, alternate_direction)
-
-    if primary_layout["fits"]:
-        if preferred == "vertical" and aspect_ratio >= 1.7:
-            return primary_layout
-        if alternate_layout["fits"] and int(alternate_layout["font_size"]) >= int(primary_layout["font_size"]) + 6:
-            return alternate_layout
-        return primary_layout
-    if alternate_layout["fits"]:
-        return alternate_layout
+    bias = 0.55 if preferred == "vertical" and aspect_ratio >= 1.55 and _text_supports_vertical_layout(text) else 0.25
     return min(
         (primary_layout, alternate_layout),
-        key=lambda item: (int(item["overflow"]), -int(item["font_size"]), item["direction"] != preferred),
+        key=lambda item: (
+            _layout_score_tuple(item, box_size)[0],
+            _layout_score_tuple(item, box_size)[1],
+            _layout_score_tuple(item, box_size)[2] + (0.0 if item["direction"] == preferred else bias),
+            _layout_score_tuple(item, box_size)[3],
+        ),
     )
+
+
+def _layout_requires_extra_margin(layout: dict[str, Any], box_size: tuple[int, int]) -> bool:
+    box_width, box_height = box_size
+    content_width = int(layout.get("content_width") or 0)
+    content_height = int(layout.get("content_height") or 0)
+    if content_width > box_width * 0.88 or content_height > box_height * 0.88:
+        return True
+    lines = [str(item).strip() for item in layout.get("lines", []) if str(item).strip()]
+    if len(lines) > 1 and len(lines[-1]) <= 1:
+        return True
+    return False
+
+
+def _fit_text_layout_for_render(
+    text: str,
+    box_size: tuple[int, int],
+    preferred_direction: Any = None,
+) -> dict[str, Any]:
+    inset_x = 0
+    inset_y = 0
+    current_box = box_size
+    layout = _fit_text_layout_to_box(text, current_box, preferred_direction)
+    for _ in range(3):
+        if not _layout_requires_extra_margin(layout, current_box):
+            break
+        inset_x += 2 if box_size[0] >= 72 else 1
+        inset_y += 2 if box_size[1] >= 72 else 1
+        current_box = (
+            max(8, box_size[0] - inset_x * 2),
+            max(8, box_size[1] - inset_y * 2),
+        )
+        layout = _fit_text_layout_to_box(text, current_box, preferred_direction or layout.get("direction"))
+    if inset_x or inset_y:
+        layout = dict(layout)
+        layout["render_inset"] = (inset_x, inset_y)
+    return layout
 
 
 def _resolve_region_insets(
@@ -2009,11 +2491,11 @@ def _resolve_region_insets(
         padding_ratio = max(0.55, min(0.92, padding_ratio))
 
     if direction == "vertical":
-        inset_x_ratio = 0.18 if aspect_ratio >= 2.6 else 0.15 if aspect_ratio >= 1.8 else 0.12
-        inset_y_ratio = 0.08 if aspect_ratio >= 2.2 else 0.10
+        inset_x_ratio = 0.20 if aspect_ratio >= 2.6 else 0.17 if aspect_ratio >= 1.8 else 0.14
+        inset_y_ratio = 0.10 if aspect_ratio >= 2.2 else 0.12
     else:
-        inset_x_ratio = 0.10 if width >= height else 0.12
-        inset_y_ratio = 0.12 if width >= height else 0.10
+        inset_x_ratio = 0.12 if width >= height else 0.14
+        inset_y_ratio = 0.14 if width >= height else 0.12
 
     if padding_ratio is not None:
         requested_margin = max(0.04, min(0.22, (1.0 - padding_ratio) / 2))
@@ -2351,6 +2833,97 @@ def _resolve_mask_content_box(
     return content_left, content_top, content_right, content_bottom
 
 
+def _shrink_mask(mask: Image.Image, steps: int) -> Image.Image:
+    if steps <= 0 or mask.getbbox() is None:
+        return mask
+    result = mask
+    for _ in range(max(1, int(steps))):
+        shrunk = result.filter(ImageFilter.MinFilter(3))
+        if shrunk.getbbox() is None:
+            break
+        result = shrunk
+    return result
+
+
+def _build_region_fill_area_mask(
+    outer_mask: Image.Image,
+    fill_shape: str,
+    direction: str,
+) -> Image.Image:
+    shrink_steps = 1 if fill_shape == "ellipse" else 0
+    if direction == "vertical" and shrink_steps > 0:
+        shrink_steps += 1
+    return _shrink_mask(outer_mask, shrink_steps)
+
+
+def _build_region_safe_text_mask(
+    fill_mask: Image.Image,
+    fill_shape: str,
+    direction: str,
+) -> Image.Image:
+    shrink_steps = 3 if fill_shape == "ellipse" else 2 if fill_shape == "roundrect" else 1
+    if direction == "vertical":
+        shrink_steps += 1
+    return _shrink_mask(fill_mask, shrink_steps)
+
+
+def _resolve_region_text_box(
+    region: dict[str, Any],
+    *,
+    image_size: tuple[int, int],
+    body_bbox: tuple[int, int, int, int],
+    safe_mask: Image.Image,
+    fill_shape: str,
+    direction: str,
+) -> tuple[int, int, int, int]:
+    safe_box = _normalize_region_box_within(region.get("safe_box"), image_size, body_bbox)
+    derived_box_rel = _resolve_mask_content_box(safe_mask, fill_shape, direction)
+    derived_box_abs: tuple[int, int, int, int] | None = None
+    if derived_box_rel is not None:
+        derived_box_abs = _intersect_region_bboxes(
+            (
+                body_bbox[0] + derived_box_rel[0],
+                body_bbox[1] + derived_box_rel[1],
+                body_bbox[0] + derived_box_rel[2],
+                body_bbox[1] + derived_box_rel[3],
+            ),
+            body_bbox,
+        )
+
+    if safe_box is not None:
+        target_box = safe_box
+        if derived_box_abs is not None:
+            overlap = _intersect_region_bboxes(safe_box, derived_box_abs)
+            if overlap is not None:
+                overlap_area = (overlap[2] - overlap[0]) * (overlap[3] - overlap[1])
+                safe_area = (safe_box[2] - safe_box[0]) * (safe_box[3] - safe_box[1])
+                if overlap_area >= safe_area * 0.72:
+                    target_box = overlap
+        tightened = _shrink_absolute_bbox(
+            target_box,
+            max(1, min(8, (target_box[2] - target_box[0]) // 18)),
+            max(1, min(8, (target_box[3] - target_box[1]) // 18)),
+        )
+        return tightened or target_box
+
+    if derived_box_abs is not None:
+        tightened = _shrink_absolute_bbox(
+            derived_box_abs,
+            max(1, min(8, (derived_box_abs[2] - derived_box_abs[0]) // (10 if direction == "vertical" else 12))),
+            max(1, min(8, (derived_box_abs[3] - derived_box_abs[1]) // (12 if direction == "vertical" else 10))),
+        )
+        return tightened or derived_box_abs
+
+    inset_x, inset_y = _resolve_region_insets(region, body_bbox, direction)
+    fallback_box = (
+        body_bbox[0] + inset_x,
+        body_bbox[1] + inset_y,
+        body_bbox[2] - inset_x,
+        body_bbox[3] - inset_y,
+    )
+    return _intersect_region_bboxes(fallback_box, body_bbox) or body_bbox
+
+
 def _apply_region_mask_fill(
     canvas: Image.Image,
     bbox: tuple[int, int, int, int],
@@ -2374,6 +2947,16 @@ def _render_text_layout(
     text_color: tuple[int, int, int],
 ) -> None:
     box_width, box_height = box_size
+    render_inset = layout.get("render_inset") or (0, 0)
+    try:
+        inset_x, inset_y = int(render_inset[0]), int(render_inset[1])
+    except (TypeError, ValueError, IndexError):
+        inset_x, inset_y = 0, 0
+    if inset_x or inset_y:
+        region_left += max(0, inset_x)
+        region_top += max(0, inset_y)
+        box_width = max(1, box_width - max(0, inset_x) * 2)
+        box_height = max(1, box_height - max(0, inset_y) * 2)
     font = layout["font"]
     direction = str(layout.get("direction") or "horizontal")
 
@@ -2430,58 +3013,231 @@ def _render_text_layout(
     )
 
 
-def _build_manga_chat_layout_prompt(
+def _normalize_manga_text_direction(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    alias_map = {
+        "v": "vertical",
+        "vert": "vertical",
+        "vertical": "vertical",
+        "竖排": "vertical",
+        "h": "horizontal",
+        "hor": "horizontal",
+        "horizontal": "horizontal",
+        "横排": "horizontal",
+    }
+    return alias_map.get(normalized)
+
+
+
+def _normalize_manga_region_shape(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    alias_map = {
+        "oval": "ellipse",
+        "ellipse": "ellipse",
+        "circle": "ellipse",
+        "round": "roundrect",
+        "rounded": "roundrect",
+        "roundrect": "roundrect",
+        "rounded_rectangle": "roundrect",
+        "box": "rect",
+        "rect": "rect",
+        "rectangle": "rect",
+    }
+    return alias_map.get(normalized)
+
+
+
+def _normalize_manga_padding_ratio(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.55, min(0.90, parsed))
+
+
+
+def _coerce_manga_ocr_region(
+    raw_region: Any,
     *,
-    target_language: str,
     image_size: tuple[int, int],
-) -> str:
-    width, height = image_size
-    return (
-        "You are a manga page translation layout analyzer. "
-        f"Detect every readable text region and translate it into {target_language}. "
-        "Return JSON only. Do not output markdown or explanations. "
-        'JSON schema: {"regions":[{"bbox":[x1,y1,x2,y2],"source_text":"...","translation":"...","background":"#RRGGBB","text_color":"#RRGGBB","direction":"vertical|horizontal","align":"center","padding_ratio":0.72,"shape":"ellipse|roundrect|rect"}]}. '
-        f"Coordinates must use the original image pixels. Original image size: {width}x{height}. "
-        "Auto-detect the original language from the image. "
-        "Prefer one region per speech bubble, caption box, or sound effect block. "
-        "For tall speech bubbles, prefer direction=vertical. For wide speech bubbles or narration boxes, prefer direction=horizontal. "
-        "padding_ratio must be a number between 0.55 and 0.90 describing the safe inner area for redrawing text. "
-        "shape should describe the original bubble body when possible. "
-        "translation must be ready to render directly inside the original bubble."
+    fallback_order: int,
+) -> MangaOcrRegion | None:
+    if not isinstance(raw_region, dict):
+        return None
+
+    source_text = str(raw_region.get("source_text") or raw_region.get("text") or "").strip()
+    bbox = _normalize_region_bbox(raw_region.get("bbox"), image_size)
+    if bbox is None or not source_text:
+        return None
+
+    body_bbox = _normalize_region_box_within(raw_region.get("body_bbox"), image_size, bbox) or bbox
+    safe_box = _normalize_region_box_within(raw_region.get("safe_box"), image_size, body_bbox)
+    source_direction = _normalize_manga_text_direction(raw_region.get("source_direction"))
+    direction = _normalize_manga_text_direction(raw_region.get("direction")) or source_direction
+    if direction is None:
+        direction = _normalize_layout_direction(
+            source_direction,
+            (max(8, body_bbox[2] - body_bbox[0]), max(8, body_bbox[3] - body_bbox[1])),
+            source_text,
+        )
+
+    try:
+        order = int(raw_region.get("order") or fallback_order)
+    except (TypeError, ValueError):
+        order = fallback_order
+
+    background = str(raw_region.get("background") or "").strip() or None
+    text_color = str(raw_region.get("text_color") or "").strip() or None
+    shape = _normalize_manga_region_shape(raw_region.get("shape"))
+    padding_ratio = _normalize_manga_padding_ratio(raw_region.get("padding_ratio"))
+
+    return MangaOcrRegion(
+        order=max(1, order),
+        bbox=bbox,
+        body_bbox=body_bbox,
+        safe_box=safe_box,
+        source_text=source_text,
+        source_direction=source_direction,
+        direction=direction,
+        background=background,
+        text_color=text_color,
+        shape=shape,
+        padding_ratio=padding_ratio,
     )
 
 
-async def _request_manga_chat_layout_payload(
+
+def _coerce_manga_ocr_page_payload(
+    raw_payload: dict[str, Any],
     *,
-    settings: TranslationSettings,
-    provider: str,
+    image_size: tuple[int, int],
+    page_number: int,
+) -> MangaOcrPagePayload:
+    regions_value = raw_payload.get("regions")
+    if not isinstance(regions_value, list):
+        raise ValueError("视觉 OCR 模型返回缺少 regions 数组")
+
+    raw_region_count = len(regions_value)
+    regions: list[MangaOcrRegion] = []
+    for index, raw_region in enumerate(regions_value, start=1):
+        region = _coerce_manga_ocr_region(raw_region, image_size=image_size, fallback_order=index)
+        if region is not None:
+            regions.append(region)
+    coerced_region_count = len(regions)
+    deduped_regions, deduped_region_count = _dedupe_manga_ocr_regions(regions)
+
+    ordered_regions = sorted(
+        deduped_regions,
+        key=lambda item: (
+            item.order,
+            item.bbox[1] if item.bbox else 0,
+            item.bbox[0] if item.bbox else 0,
+        ),
+    )
+    normalized_regions = [
+        region.model_copy(update={"order": index})
+        for index, region in enumerate(ordered_regions, start=1)
+    ]
+    return MangaOcrPagePayload(
+        page_number=page_number,
+        image_size=image_size,
+        regions=normalized_regions,
+        diagnostics={
+            "raw_region_count": raw_region_count,
+            "coerced_region_count": coerced_region_count,
+            "deduped_region_count": deduped_region_count,
+            "final_region_count": len(normalized_regions),
+        },
+    )
+
+
+
+def _estimate_manga_region_char_budget(region: MangaOcrRegion) -> int:
+    bbox = region.safe_box or region.body_bbox or region.bbox
+    if bbox is None:
+        return 32
+    width = max(8, bbox[2] - bbox[0])
+    height = max(8, bbox[3] - bbox[1])
+    area = width * height
+    direction = str(region.direction or region.source_direction or "horizontal")
+    budget = int(round(area / (1600 if direction == "vertical" else 900)))
+    if direction == "vertical":
+        budget = min(budget, max(6, height // 18 + 4))
+    if width <= 72:
+        budget = min(budget, 20)
+    return max(6, min(72, budget))
+
+
+
+def _normalize_manga_region_translation_text(value: Any) -> str:
+    text = _strip_markdown_fences(str(value or ""))
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    if len(text) >= 2 and (text[0], text[-1]) in {
+        ('"', '"'),
+        ("'", "'"),
+        ("“", "”"),
+        ("「", "」"),
+        ("『", "』"),
+    }:
+        inner = text[1:-1].strip()
+        if inner:
+            text = inner
+    return text
+
+
+
+def _build_manga_ocr_prompt(*, image_size: tuple[int, int]) -> str:
+    width, height = image_size
+    return (
+        "You are a manga OCR and layout analyzer. "
+        "Detect every readable text region on the page. "
+        "Return JSON only. Do not output markdown or explanations. "
+        'JSON schema: {"regions":[{"order":1,"bbox":[x1,y1,x2,y2],"body_bbox":[x1,y1,x2,y2],"safe_box":[x1,y1,x2,y2],"source_text":"...","background":"#RRGGBB","text_color":"#RRGGBB","source_direction":"vertical|horizontal","direction":"vertical|horizontal","padding_ratio":0.72,"shape":"ellipse|roundrect|rect"}]}. '
+        f"Coordinates must use the original image pixels. Original image size: {width}x{height}. "
+        "Auto-detect the original language from the image. "
+        "Do not translate the text. Keep source_text exactly as recognized from the image. "
+        "Prefer one region per speech bubble, caption box, or sound effect block. "
+        "bbox may include the full readable area, but body_bbox should cover the bubble or caption body and exclude tails when possible. "
+        "safe_box should be a conservative inner rectangle that avoids borders and tails. "
+        "source_direction should describe the original text flow; direction should describe the recommended render direction for translated text. "
+        "For tall bubbles, prefer vertical. For wide bubbles or narration boxes, prefer horizontal. "
+        "padding_ratio must be a number between 0.55 and 0.90 describing the safe inner area for redrawing text. "
+        "shape should describe the original bubble body when possible."
+    )
+
+
+
+async def _request_manga_ocr_regions_payload(
+    *,
     base_url: str,
     api_key: str,
     model: str,
     image_path: Path,
-    target_language: str,
     timeout_seconds: int,
-) -> dict[str, Any]:
+    page_number: int = 0,
+) -> MangaOcrPagePayload:
     with Image.open(image_path) as image:
         image_size = image.size
     image_bytes = image_path.read_bytes()
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
-    prompt = _build_manga_chat_layout_prompt(
-        target_language=target_language,
-        image_size=image_size,
-    )
+    prompt = _build_manga_ocr_prompt(image_size=image_size)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
         "model": model,
-        "temperature": 0.2,
-        "max_tokens": 2400,
+        "temperature": 0.1,
+        "max_tokens": 3000,
         "messages": [
             {
                 "role": "system",
-                "content": "You are a precise manga OCR and translation layout assistant. Output valid JSON only.",
+                "content": "You are a precise manga OCR assistant. Output valid JSON only.",
             },
             {
                 "role": "user",
@@ -2508,59 +3264,335 @@ async def _request_manga_chat_layout_payload(
 
     choices = response_payload.get("choices", [])
     if not choices:
-        raise ValueError("视觉翻译模型未返回任何候选结果")
+        raise ValueError("视觉 OCR 模型未返回任何候选结果")
     message = choices[0].get("message", {})
     content = _normalize_translation_result(message.get("content", ""))
-    return _extract_json_object_from_text(content)
+    raw_payload = _extract_json_object_from_text(content)
+    return _coerce_manga_ocr_page_payload(raw_payload, image_size=image_size, page_number=page_number)
 
 
-def _render_manga_chat_layout_to_image(
+
+def _build_manga_region_translation_prompt(
+    *,
+    target_language: str,
+    chapter_title: str,
+    chapter_index: int,
+    page_number: int,
+    total_pages: int,
+    regions: list[MangaOcrRegion],
+) -> str:
+    source_items = [
+        {
+            "order": region.order,
+            "source_text": region.source_text,
+            "source_direction": region.source_direction,
+            "direction": region.direction,
+            "box_size": [
+                max(8, (region.safe_box or region.body_bbox or region.bbox or (0, 0, 8, 8))[2] - (region.safe_box or region.body_bbox or region.bbox or (0, 0, 8, 8))[0]),
+                max(8, (region.safe_box or region.body_bbox or region.bbox or (0, 0, 8, 8))[3] - (region.safe_box or region.body_bbox or region.bbox or (0, 0, 8, 8))[1]),
+            ],
+            "max_chars_hint": _estimate_manga_region_char_budget(region),
+        }
+        for region in regions
+    ]
+    return (
+        "You are a manga text translator. "
+        f"Translate each source_text into {target_language}. "
+        "Return JSON only. Do not output markdown or explanations. "
+        'JSON schema: {"translations":[{"order":1,"translation":"..."}]}. '
+        "Return exactly one translation item for each input item and keep the same reading order. "
+        "Translate only the text itself. Do not add notes, speaker labels, or explanations. "
+        "Prefer concise, bubble-safe translations. "
+        "Each item includes box_size and max_chars_hint; when wording would likely overflow, compress it while keeping the original meaning, tone, and emphasis. "
+        "For narrow or vertical bubbles, prefer shorter phrasing and avoid unnecessary punctuation. "
+        "Keep names, tone, emphasis, and line intent natural for manga dialogue/captions. "
+        f"Context: chapter_title={chapter_title}, chapter_index={chapter_index}, page={page_number}/{total_pages}. "
+        f"Input regions: {json.dumps(source_items, ensure_ascii=False)}"
+    )
+
+
+
+def _coerce_manga_translated_regions(
+    raw_payload: dict[str, Any],
+    regions: list[MangaOcrRegion],
+) -> list[MangaTranslatedRegion]:
+    translations_value = raw_payload.get("translations")
+    if not isinstance(translations_value, list):
+        raise ValueError("漫画文本翻译模型返回缺少 translations 数组")
+
+    translations_by_order: dict[int, str] = {}
+    positional_translations: list[str] = []
+    for index, item in enumerate(translations_value, start=1):
+        if isinstance(item, dict):
+            try:
+                order = int(item.get("order") or index)
+            except (TypeError, ValueError):
+                order = index
+            translation = _normalize_manga_region_translation_text(item.get("translation") or item.get("text") or "")
+        else:
+            order = index
+            translation = _normalize_manga_region_translation_text(item)
+        positional_translations.append(translation)
+        if translation:
+            translations_by_order[order] = translation
+
+    translated_regions: list[MangaTranslatedRegion] = []
+    for index, region in enumerate(regions, start=1):
+        translation = translations_by_order.get(region.order)
+        if translation is None and index - 1 < len(positional_translations):
+            translation = positional_translations[index - 1]
+        translated_regions.append(
+            MangaTranslatedRegion(
+                **region.model_dump(),
+                translation=_normalize_manga_region_translation_text(translation),
+            )
+        )
+    return translated_regions
+
+
+
+def _build_manga_page_translation_diagnostics(
+    ocr_payload: MangaOcrPagePayload,
+    translated_regions: list[MangaTranslatedRegion],
+) -> dict[str, Any]:
+    non_empty_translation_count = sum(1 for region in translated_regions if str(region.translation or "").strip())
+    unchanged_translation_count = sum(
+        1
+        for region in translated_regions
+        if str(region.translation or "").strip()
+        and str(region.translation or "").strip() == str(region.source_text or "").strip()
+    )
+    vertical_region_count = sum(
+        1
+        for region in translated_regions
+        if str(region.direction or region.source_direction or "") == "vertical"
+    )
+    safe_box_region_count = sum(1 for region in translated_regions if region.safe_box is not None)
+    return {
+        **dict(ocr_payload.diagnostics or {}),
+        "region_count": len(translated_regions),
+        "non_empty_translation_count": non_empty_translation_count,
+        "empty_translation_count": max(0, len(translated_regions) - non_empty_translation_count),
+        "unchanged_translation_count": unchanged_translation_count,
+        "vertical_region_count": vertical_region_count,
+        "safe_box_region_count": safe_box_region_count,
+        "source_char_total": sum(len(str(region.source_text or "").strip()) for region in translated_regions),
+        "translation_char_total": sum(len(str(region.translation or "").strip()) for region in translated_regions),
+    }
+
+
+
+async def _translate_manga_region_batch(
+    *,
+    settings: TranslationSettings,
+    base_url: str,
+    api_key: str,
+    model: str,
+    target_language: str,
+    chapter_title: str,
+    chapter_index: int,
+    page_number: int,
+    total_pages: int,
+    regions: list[MangaOcrRegion],
+    timeout_seconds: int,
+) -> list[MangaTranslatedRegion]:
+    if not regions:
+        return []
+
+    prompt = _build_manga_region_translation_prompt(
+        target_language=_resolve_translation_target_language(target_language),
+        chapter_title=chapter_title,
+        chapter_index=chapter_index,
+        page_number=page_number,
+        total_pages=total_pages,
+        regions=regions,
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": 3000,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise manga translator. "
+                    "Translate text only and output valid JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+    async with _create_async_http_client(timeout=float(timeout_seconds), follow_redirects=True) as client:
+        response_payload = await _post_translation_json(
+            client,
+            f"{base_url}/chat/completions",
+            headers=headers,
+            payload=payload,
+        )
+
+    choices = response_payload.get("choices", [])
+    if not choices:
+        raise ValueError("漫画文本翻译模型未返回任何候选结果")
+    message = choices[0].get("message", {})
+    content = _normalize_translation_result(message.get("content", ""))
+    raw_payload = _extract_json_object_from_text(content)
+    return _coerce_manga_translated_regions(raw_payload, regions)
+
+
+
+async def _build_translated_manga_page_payload(
+    *,
+    settings: TranslationSettings,
+    base_url: str,
+    api_key: str,
+    model: str,
     image_path: Path,
-    layout_payload: dict[str, Any],
-) -> tuple[bytes, str]:
-    regions = layout_payload.get("regions")
-    if not isinstance(regions, list):
-        raise ValueError("视觉翻译模型返回缺少 regions 数组")
+    target_language: str,
+    timeout_seconds: int,
+    chapter_title: str = "",
+    chapter_index: int = 0,
+    page_number: int = 0,
+    total_pages: int = 0,
+    source_image_file: str | None = None,
+    translated_image_file: str | None = None,
+) -> MangaTranslatedPagePayload:
+    ocr_payload = await _request_manga_ocr_regions_payload(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        image_path=image_path,
+        timeout_seconds=timeout_seconds,
+        page_number=page_number,
+    )
+    translated_regions = await _translate_manga_region_batch(
+        settings=settings,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        target_language=target_language,
+        chapter_title=chapter_title,
+        chapter_index=chapter_index,
+        page_number=page_number,
+        total_pages=total_pages,
+        regions=ocr_payload.regions,
+        timeout_seconds=timeout_seconds,
+    )
+    diagnostics = _build_manga_page_translation_diagnostics(ocr_payload, translated_regions)
+    page_translation = "\n".join(
+        region.translation.strip()
+        for region in translated_regions
+        if region.translation.strip()
+    ).strip() or "【本页未识别到可翻译文字】"
+    return MangaTranslatedPagePayload(
+        page_number=page_number,
+        image_size=ocr_payload.image_size,
+        target_language=_resolve_translation_target_language(target_language),
+        render_mode="ocr_pipeline",
+        source_image_file=source_image_file,
+        translated_image_file=translated_image_file,
+        page_translation=page_translation,
+        regions=translated_regions,
+        diagnostics=diagnostics,
+    )
 
+
+
+def _render_translated_manga_page_to_image(
+    image_path: Path,
+    page_payload: MangaTranslatedPagePayload,
+) -> tuple[bytes, str, dict[str, Any]]:
     with Image.open(image_path) as source_image:
         canvas = source_image.convert("RGBA")
 
     draw = ImageDraw.Draw(canvas)
     rendered_translations: list[str] = []
+    rendered_region_count = 0
+    skipped_empty_region_count = 0
+    skipped_bbox_region_count = 0
+    rendered_vertical_count = 0
+    rendered_horizontal_count = 0
+    layout_retry_count = 0
+    overflow_region_count = 0
+    max_overflow = 0.0
 
-    for region in regions:
-        if not isinstance(region, dict):
+    for region in page_payload.regions:
+        bbox = region.bbox
+        translation = str(region.translation or "").strip()
+        if bbox is None:
+            skipped_bbox_region_count += 1
             continue
-        bbox = _normalize_region_bbox(region.get("bbox"), canvas.size)
-        translation = str(region.get("translation") or "").strip()
-        if bbox is None or not translation:
+        if not translation:
+            skipped_empty_region_count += 1
             continue
 
-        fill_color = _sample_region_fill_color(canvas, bbox, region.get("background"))
-        text_color = _resolve_text_color(fill_color, region.get("text_color"))
-        x1, y1, x2, y2 = bbox
-        preferred_direction = region.get("direction")
-        initial_layout = _fit_text_layout_to_box(translation, (max(8, x2 - x1), max(8, y2 - y1)), preferred_direction)
+        region_payload = region.model_dump(exclude_none=True)
+        body_bbox = region.body_bbox or bbox
+        fill_color = _sample_region_fill_color(
+            canvas,
+            body_bbox,
+            region.background,
+            body_bbox=body_bbox,
+        )
+        text_color = _resolve_text_color(fill_color, region.text_color)
+        x1, y1, x2, y2 = body_bbox
+        preferred_direction = region.direction
+        source_direction = region.source_direction
+        direction_hint = preferred_direction or source_direction
+        initial_layout = _fit_text_layout_to_box(
+            translation,
+            (max(8, x2 - x1), max(8, y2 - y1)),
+            direction_hint,
+        )
         resolved_direction = str(initial_layout.get("direction") or "horizontal")
-        fill_shape = _resolve_region_fill_shape(region, bbox, resolved_direction)
-        bubble_mask = _extract_precise_bubble_mask(canvas, bbox, fill_color, fill_shape)
-        _apply_region_mask_fill(canvas, bbox, fill_color, bubble_mask)
+        fill_shape = _resolve_region_fill_shape(region_payload, body_bbox, resolved_direction)
+        bubble_outline_mask = _extract_precise_bubble_mask(canvas, body_bbox, fill_color, fill_shape)
+        bubble_fill_mask = _build_region_fill_area_mask(bubble_outline_mask, fill_shape, resolved_direction)
+        _apply_region_mask_fill(canvas, body_bbox, fill_color, bubble_fill_mask)
         draw = ImageDraw.Draw(canvas)
 
-        content_box = _resolve_mask_content_box(bubble_mask, fill_shape, resolved_direction)
-        if content_box is None:
-            inset_x, inset_y = _resolve_region_insets(region, bbox, resolved_direction)
-            text_left = x1 + inset_x
-            text_top = y1 + inset_y
-            box_width = max(8, x2 - x1 - inset_x * 2)
-            box_height = max(8, y2 - y1 - inset_y * 2)
-        else:
-            text_left = x1 + content_box[0]
-            text_top = y1 + content_box[1]
-            box_width = max(8, content_box[2] - content_box[0])
-            box_height = max(8, content_box[3] - content_box[1])
+        safe_text_mask = _build_region_safe_text_mask(bubble_fill_mask, fill_shape, resolved_direction)
+        content_box = _resolve_region_text_box(
+            region_payload,
+            image_size=canvas.size,
+            body_bbox=body_bbox,
+            safe_mask=safe_text_mask,
+            fill_shape=fill_shape,
+            direction=resolved_direction,
+        )
+        text_left = content_box[0]
+        text_top = content_box[1]
+        box_width = max(8, content_box[2] - content_box[0])
+        box_height = max(8, content_box[3] - content_box[1])
 
-        layout = _fit_text_layout_to_box(translation, (box_width, box_height), preferred_direction or resolved_direction)
+        layout = _fit_text_layout_for_render(
+            translation,
+            (box_width, box_height),
+            preferred_direction or resolved_direction,
+        )
+        if preferred_direction is None and source_direction == "vertical":
+            chosen_direction = str(layout.get("direction") or "")
+            if chosen_direction != "vertical" and _text_supports_vertical_layout(translation):
+                vertical_layout = _fit_text_layout_for_render(translation, (box_width, box_height), "vertical")
+                if _layout_score_tuple(vertical_layout, (box_width, box_height)) <= _layout_score_tuple(layout, (box_width, box_height)):
+                    layout = vertical_layout
+                    layout_retry_count += 1
+        if not bool(layout.get("fits")):
+            alternate_direction = "horizontal" if str(layout.get("direction") or preferred_direction or resolved_direction) == "vertical" else "vertical"
+            alternate_layout = _fit_text_layout_for_render(translation, (box_width, box_height), alternate_direction)
+            if _layout_score_tuple(alternate_layout, (box_width, box_height)) < _layout_score_tuple(layout, (box_width, box_height)):
+                layout = alternate_layout
+                layout_retry_count += 1
+        overflow_value = float(layout.get("overflow") or 0.0)
+        if overflow_value > 0:
+            overflow_region_count += 1
+            max_overflow = max(max_overflow, overflow_value)
         _render_text_layout(
             draw,
             text_left,
@@ -2570,11 +3602,132 @@ def _render_manga_chat_layout_to_image(
             text_color,
         )
         rendered_translations.append(translation)
+        rendered_region_count += 1
+        if str(layout.get("direction") or "horizontal") == "vertical":
+            rendered_vertical_count += 1
+        else:
+            rendered_horizontal_count += 1
 
     output = BytesIO()
     canvas.save(output, format="PNG")
-    page_translation = "\n".join(rendered_translations).strip() or "【本页未识别到可翻译文字】"
-    return output.getvalue(), page_translation
+    page_translation = page_payload.page_translation.strip() or "\n".join(rendered_translations).strip()
+    if not page_translation:
+        page_translation = "【本页未识别到可翻译文字】"
+    return (
+        output.getvalue(),
+        page_translation,
+        {
+            "rendered_region_count": rendered_region_count,
+            "skipped_empty_region_count": skipped_empty_region_count,
+            "skipped_bbox_region_count": skipped_bbox_region_count,
+            "rendered_vertical_count": rendered_vertical_count,
+            "rendered_horizontal_count": rendered_horizontal_count,
+            "layout_retry_count": layout_retry_count,
+            "overflow_region_count": overflow_region_count,
+            "max_overflow": round(max_overflow, 3),
+        },
+    )
+
+
+
+def _format_manga_page_diagnostics_log(log_prefix: str, page_payload: MangaTranslatedPagePayload) -> str:
+    diagnostics = dict(page_payload.diagnostics or {})
+    return (
+        f"{log_prefix}诊断：mode={page_payload.render_mode}, "
+        f"regions={diagnostics.get('region_count', len(page_payload.regions))}, "
+        f"empty={diagnostics.get('empty_translation_count', 0)}, "
+        f"overflow={diagnostics.get('overflow_region_count', 0)}, "
+        f"pipeline_ms={diagnostics.get('pipeline_ms', 0)}"
+    )
+
+
+
+async def _emit_single_image_diagnostics(
+    *,
+    log_callback: Callable[[str, str], Awaitable[None] | None] | None,
+    page_payload: MangaTranslatedPagePayload,
+    source_name: str,
+    target_language: str,
+    trace_id: str,
+) -> None:
+    if log_callback is None:
+        return
+    diagnostics = dict(page_payload.diagnostics or {})
+    summary = {
+        "trace_id": trace_id,
+        "source_image": Path(source_name).name,
+        "target_language": _resolve_translation_target_language(target_language),
+        "render_mode": page_payload.render_mode,
+        "region_count": int(diagnostics.get("region_count") or len(page_payload.regions)),
+        "empty_translation_count": int(diagnostics.get("empty_translation_count") or 0),
+        "overflow_region_count": int(diagnostics.get("overflow_region_count") or 0),
+        "pipeline_ms": diagnostics.get("pipeline_ms"),
+        "ocr_translate_ms": diagnostics.get("ocr_translate_ms"),
+        "render_ms": diagnostics.get("render_ms"),
+    }
+    await _notify_task_log(
+        log_callback,
+        "info",
+        f"[single-image-diagnostics]{json.dumps(summary, ensure_ascii=False, separators=(',', ':'))}",
+    )
+
+
+
+async def _translate_manga_page_with_pipeline(
+    *,
+    settings: TranslationSettings,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    image_path: Path,
+    target_language: str,
+    timeout_seconds: int,
+    chapter_title: str = "",
+    chapter_index: int = 0,
+    page_number: int = 0,
+    total_pages: int = 0,
+    source_image_file: str | None = None,
+    translated_image_file: str | None = None,
+) -> tuple[bytes, str, MangaTranslatedPagePayload]:
+    del provider
+    pipeline_started_at = time.perf_counter()
+    payload_started_at = time.perf_counter()
+    page_payload = await _build_translated_manga_page_payload(
+        settings=settings,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        image_path=image_path,
+        target_language=target_language,
+        timeout_seconds=timeout_seconds,
+        chapter_title=chapter_title,
+        chapter_index=chapter_index,
+        page_number=page_number,
+        total_pages=total_pages,
+        source_image_file=source_image_file,
+        translated_image_file=translated_image_file,
+    )
+    ocr_translate_ms = round((time.perf_counter() - payload_started_at) * 1000, 1)
+    render_started_at = time.perf_counter()
+    translated_bytes, page_translation, render_diagnostics = await asyncio.to_thread(
+        _render_translated_manga_page_to_image,
+        image_path,
+        page_payload,
+    )
+    render_ms = round((time.perf_counter() - render_started_at) * 1000, 1)
+    finalized_diagnostics = dict(page_payload.diagnostics or {})
+    finalized_diagnostics.update(render_diagnostics)
+    finalized_diagnostics["ocr_translate_ms"] = ocr_translate_ms
+    finalized_diagnostics["render_ms"] = render_ms
+    finalized_diagnostics["pipeline_ms"] = round((time.perf_counter() - pipeline_started_at) * 1000, 1)
+    finalized_payload = page_payload.model_copy(
+        update={
+            "page_translation": page_translation,
+            "diagnostics": finalized_diagnostics,
+        }
+    )
+    return translated_bytes, page_translation, finalized_payload
 
 
 async def _translate_manga_page_with_chat_completions(
@@ -2587,8 +3740,14 @@ async def _translate_manga_page_with_chat_completions(
     image_path: Path,
     target_language: str,
     timeout_seconds: int,
+    chapter_title: str = "",
+    chapter_index: int = 0,
+    page_number: int = 0,
+    total_pages: int = 0,
+    source_image_file: str | None = None,
+    translated_image_file: str | None = None,
 ) -> tuple[bytes, str]:
-    layout_payload = await _request_manga_chat_layout_payload(
+    translated_bytes, page_translation, _ = await _translate_manga_page_with_pipeline(
         settings=settings,
         provider=provider,
         base_url=base_url,
@@ -2597,8 +3756,15 @@ async def _translate_manga_page_with_chat_completions(
         image_path=image_path,
         target_language=target_language,
         timeout_seconds=timeout_seconds,
+        chapter_title=chapter_title,
+        chapter_index=chapter_index,
+        page_number=page_number,
+        total_pages=total_pages,
+        source_image_file=source_image_file,
+        translated_image_file=translated_image_file,
     )
-    return await asyncio.to_thread(_render_manga_chat_layout_to_image, image_path, layout_payload)
+    return translated_bytes, page_translation
+
 
 
 def _ensure_png_image_bytes(image_bytes: bytes) -> bytes:
@@ -2613,6 +3779,7 @@ def _ensure_png_image_bytes(image_bytes: bytes) -> bytes:
             image = image.convert("RGB")
         image.save(output, format="PNG")
         return output.getvalue()
+
 
 
 async def _request_manga_image_edit_bytes(
@@ -2702,6 +3869,8 @@ async def _request_manga_image_edit_bytes(
                 resolved_image = _extract_image_bytes_from_payload(payload)
                 if isinstance(resolved_image, bytes):
                     return resolved_image
+                if not isinstance(resolved_image, str):
+                    raise ValueError("漫画译图接口返回缺少可下载图片地址")
 
                 download_response = await client.get(resolved_image)
                 download_response.raise_for_status()
@@ -2736,7 +3905,8 @@ async def _request_manga_image_edit_bytes(
     raise last_error or ValueError("漫画译图请求失败")
 
 
-async def _translate_manga_pages_with_command(
+
+async def _translate_manga_pages_with_command_detailed(
     *,
     settings: TranslationSettings,
     target_language: str,
@@ -2745,7 +3915,7 @@ async def _translate_manga_pages_with_command(
     image_files: list[str],
     book_dir: Path,
     log_callback: Callable[[str, str], Awaitable[None] | None] | None = None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[MangaTranslatedPagePayload]]:
     if not image_files:
         raise ValueError("漫画章节没有可翻译的页面图片")
 
@@ -2753,9 +3923,11 @@ async def _translate_manga_pages_with_command(
     resolved_target_language = _resolve_translation_target_language(target_language)
     page_translations: list[str] = []
     translated_image_files: list[str] = []
+    translated_pages: list[MangaTranslatedPagePayload] = []
     total_pages = len(image_files)
 
     for page_number, asset_path in enumerate(image_files, start=1):
+        page_started_at = time.perf_counter()
         image_path = (book_dir / asset_path).resolve()
         if not image_path.exists():
             raise ValueError(f"漫画页面文件不存在：{asset_path}")
@@ -2780,13 +3952,14 @@ async def _translate_manga_pages_with_command(
             total_pages=total_pages,
         )
         page_translation = f"【本页已通过模型 {image_model} 完成图片翻译】"
+        page_payload: MangaTranslatedPagePayload | None = None
         if _should_use_chat_completions_image_fallback(image_model):
             await _notify_task_log(
                 log_callback,
                 "info",
                 f"{log_prefix}当前模型更适合走 /chat/completions 兼容方案，开始执行视觉识别与本地重绘",
             )
-            translated_bytes, page_translation = await _translate_manga_page_with_chat_completions(
+            translated_bytes, page_translation, page_payload = await _translate_manga_page_with_pipeline(
                 settings=settings,
                 provider=provider,
                 base_url=base_url,
@@ -2795,6 +3968,12 @@ async def _translate_manga_pages_with_command(
                 image_path=image_path,
                 target_language=resolved_target_language,
                 timeout_seconds=BUILTIN_MANGA_IMAGE_TIMEOUT_SECONDS,
+                chapter_title=title,
+                chapter_index=chapter_index,
+                page_number=page_number,
+                total_pages=total_pages,
+                source_image_file=asset_path,
+                translated_image_file=translated_asset_path,
             )
         else:
             try:
@@ -2806,6 +3985,22 @@ async def _translate_manga_pages_with_command(
                     prompt=prompt,
                     timeout_seconds=BUILTIN_MANGA_IMAGE_TIMEOUT_SECONDS,
                 )
+                page_payload = MangaTranslatedPagePayload(
+                    page_number=page_number,
+                    target_language=resolved_target_language,
+                    render_mode="image_edit_fallback",
+                    source_image_file=asset_path,
+                    translated_image_file=translated_asset_path,
+                    page_translation=page_translation,
+                    diagnostics={
+                        "region_count": 0,
+                        "non_empty_translation_count": 0,
+                        "empty_translation_count": 0,
+                        "overflow_region_count": 0,
+                        "rendered_region_count": 0,
+                        "pipeline_ms": round((time.perf_counter() - page_started_at) * 1000, 1),
+                    },
+                )
             except Exception as exc:
                 if not _should_fallback_from_image_edit_error(exc):
                     raise
@@ -2814,7 +4009,7 @@ async def _translate_manga_pages_with_command(
                     "warning",
                     f"{log_prefix}图片编辑接口不可用，切换到 /chat/completions 兼容方案：{exc}",
                 )
-                translated_bytes, page_translation = await _translate_manga_page_with_chat_completions(
+                translated_bytes, page_translation, page_payload = await _translate_manga_page_with_pipeline(
                     settings=settings,
                     provider=provider,
                     base_url=base_url,
@@ -2823,21 +4018,71 @@ async def _translate_manga_pages_with_command(
                     image_path=image_path,
                     target_language=resolved_target_language,
                     timeout_seconds=BUILTIN_MANGA_IMAGE_TIMEOUT_SECONDS,
+                    chapter_title=title,
+                    chapter_index=chapter_index,
+                    page_number=page_number,
+                    total_pages=total_pages,
+                    source_image_file=asset_path,
+                    translated_image_file=translated_asset_path,
                 )
+
         normalized_bytes = _ensure_png_image_bytes(translated_bytes)
         translated_image_path.write_bytes(normalized_bytes)
         if translated_image_path.stat().st_size <= 0:
             raise RuntimeError(f"{log_prefix}未生成有效输出图片：{translated_image_path}")
 
+        resolved_diagnostics = dict((page_payload.diagnostics if page_payload else {}) or {})
+        resolved_diagnostics.setdefault("pipeline_ms", round((time.perf_counter() - page_started_at) * 1000, 1))
+        resolved_diagnostics["output_bytes"] = len(normalized_bytes)
+        resolved_page_payload = (page_payload or MangaTranslatedPagePayload()).model_copy(
+            update={
+                "page_number": page_number,
+                "target_language": resolved_target_language,
+                "source_image_file": asset_path,
+                "translated_image_file": translated_asset_path,
+                "page_translation": page_translation,
+                "diagnostics": resolved_diagnostics,
+            }
+        )
         page_translations.append(page_translation)
         translated_image_files.append(translated_asset_path)
+        translated_pages.append(resolved_page_payload)
+        await _notify_task_log(
+            log_callback,
+            "info",
+            _format_manga_page_diagnostics_log(log_prefix, resolved_page_payload),
+        )
         await _notify_task_log(
             log_callback,
             "info",
             f"{log_prefix}处理完成，输出文件：{translated_asset_path}",
         )
 
+    return page_translations, translated_image_files, translated_pages
+
+
+
+async def _translate_manga_pages_with_command(
+    *,
+    settings: TranslationSettings,
+    target_language: str,
+    chapter_index: int,
+    title: str,
+    image_files: list[str],
+    book_dir: Path,
+    log_callback: Callable[[str, str], Awaitable[None] | None] | None = None,
+) -> tuple[list[str], list[str]]:
+    page_translations, translated_image_files, _ = await _translate_manga_pages_with_command_detailed(
+        settings=settings,
+        target_language=target_language,
+        chapter_index=chapter_index,
+        title=title,
+        image_files=image_files,
+        book_dir=book_dir,
+        log_callback=log_callback,
+    )
     return page_translations, translated_image_files
+
 
 
 def _sync_fetch_with_httpx(url: str, referer: str | None = None) -> SyncFetchResult:
@@ -2852,6 +4097,7 @@ def _sync_fetch_with_httpx(url: str, referer: str | None = None) -> SyncFetchRes
         response = client.get(url)
         response.raise_for_status()
         return SyncFetchResult(text=response.text, resolved_url=str(response.url), status_code=response.status_code)
+
 
 
 def _sync_fetch_with_requests(url: str, referer: str | None = None) -> SyncFetchResult:
@@ -3948,7 +5194,7 @@ async def download_book(payload: AddBookPayload, preview: PreviewResponse, root_
     safe_title = re.sub(r'[\/:*?"<>|]', "_", preview.title).strip() or "未命名小说"
     book_dir = root_dir / payload.language / safe_title
     book_dir.mkdir(parents=True, exist_ok=True)
-    chapter_manifest: list[dict[str, str | int]] = []
+    chapter_manifest: list[dict[str, Any]] = []
     runtime_settings = _load_runtime_settings()
     image_download_semaphore = asyncio.Semaphore(
         _image_download_concurrency(str(payload.sourceUrl), runtime_settings.downloadConcurrency)
@@ -4288,6 +5534,7 @@ def _create_async_http_client(
         timeout=timeout,
         headers=headers,
         http2=False,
+        verify=ssl.create_default_context(),
     )
 
 

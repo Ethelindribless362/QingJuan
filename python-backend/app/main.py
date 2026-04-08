@@ -12,6 +12,8 @@ import mimetypes
 import re
 import shutil
 import zipfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -20,7 +22,7 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 try:
     from .db import (
@@ -68,6 +70,7 @@ try:
         repair_18comic_chapter_images,
         save_manifest,
         translated_image_payload_is_current,
+        translate_single_manga_image,
         translate_selected_chapters,
     )
 except ImportError:
@@ -116,6 +119,7 @@ except ImportError:
         repair_18comic_chapter_images,
         save_manifest,
         translated_image_payload_is_current,
+        translate_single_manga_image,
         translate_selected_chapters,
     )
 
@@ -123,22 +127,11 @@ LIBRARY_ROOT = DATA_DIR / "library"
 EXPORT_ROOT = DATA_DIR / "exports"
 TASK_QUEUE: asyncio.Queue[str] = asyncio.Queue()
 
-app = FastAPI(title="青卷后端", version="0.2.1")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
+async def _run_startup(app_instance: FastAPI) -> None:
     init_db()
     LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
-    app.state.deleted_book_ids = set()
+    app_instance.state.deleted_book_ids = set()
     for task in list_pending_tasks():
         task.status = "queued"
         task.message = "等待队列处理"
@@ -146,18 +139,36 @@ async def on_startup() -> None:
         task.updatedAt = _now()
         save_task(task)
         TASK_QUEUE.put_nowait(task.id)
-    app.state.queue_worker = asyncio.create_task(_task_worker())
+    app_instance.state.queue_worker = asyncio.create_task(_task_worker())
 
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    worker = getattr(app.state, "queue_worker", None)
+async def _run_shutdown(app_instance: FastAPI) -> None:
+    worker = getattr(app_instance.state, "queue_worker", None)
     if worker is not None:
         worker.cancel()
         try:
             await worker
         except asyncio.CancelledError:
             pass
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+    await _run_startup(app_instance)
+    try:
+        yield
+    finally:
+        await _run_shutdown(app_instance)
+
+
+app = FastAPI(title="青卷后端", version="0.2.1", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -312,6 +323,59 @@ async def post_book_cover(book_id: str, file: UploadFile = File(...)) -> BookRec
         updated_book = book.model_copy(update={"updatedAt": _now()})
         save_book(updated_book)
         return _hydrate_book_record(updated_book)
+    finally:
+        await file.close()
+
+
+@app.post("/images/translate")
+async def post_translate_image(
+    file: UploadFile = File(...),
+    language: str = Form(...),
+    title: str = Form(default=""),
+) -> Response:
+    try:
+        normalized_language = _validate_language(language)
+        diagnostic_payload: dict[str, object] = {}
+
+        async def _collect_translate_log(level: str, message: str) -> None:
+            del level
+            prefix = "[single-image-diagnostics]"
+            if not isinstance(message, str) or not message.startswith(prefix):
+                return
+            raw_payload = message[len(prefix) :].strip()
+            if not raw_payload:
+                return
+            try:
+                parsed = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                return
+            if isinstance(parsed, dict):
+                diagnostic_payload.update(parsed)
+
+        original_name = _normalize_form_text(file.filename or "").strip() or "upload.png"
+        _validate_cover_extension(original_name, file.content_type)
+
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="图片文件为空")
+
+        translated_bytes, _ = await translate_single_manga_image(
+            image_bytes=image_bytes,
+            original_name=original_name,
+            target_language=normalized_language,
+            settings=load_settings(),
+            title=_normalize_form_text(title or "").strip() or "单图翻译",
+            log_callback=_collect_translate_log,
+        )
+        return Response(
+            content=translated_bytes,
+            media_type="image/png",
+            headers=_build_translate_image_response_headers(diagnostic_payload),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"图片翻译失败：{exc}") from exc
     finally:
         await file.close()
 
@@ -536,6 +600,35 @@ def _normalize_form_text(value: str) -> str:
     except (UnicodeEncodeError, UnicodeDecodeError):
         return normalized
     return repaired.strip() or normalized
+
+
+def _header_safe_value(value: object, *, max_length: int = 96) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = re.sub(r"[^0-9A-Za-z._:/-]+", "-", text).strip("-")
+    if not text:
+        return None
+    return text[:max_length]
+
+
+def _build_translate_image_response_headers(diagnostics: dict[str, object]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    candidates = {
+        "X-QingJuan-Manga-Source": diagnostics.get("source_image"),
+        "X-QingJuan-Manga-Trace": diagnostics.get("trace_id"),
+        "X-QingJuan-Manga-Mode": diagnostics.get("render_mode"),
+        "X-QingJuan-Manga-Regions": diagnostics.get("region_count"),
+        "X-QingJuan-Manga-Empty-Regions": diagnostics.get("empty_translation_count"),
+        "X-QingJuan-Manga-Overflow-Regions": diagnostics.get("overflow_region_count"),
+        "X-QingJuan-Manga-Pipeline-Ms": diagnostics.get("pipeline_ms"),
+    }
+    for name, value in candidates.items():
+        safe_value = _header_safe_value(value)
+        if safe_value:
+            headers[name] = safe_value
+    return headers
 
 
 def _sanitize_book_title(title: str) -> str:
