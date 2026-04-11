@@ -25,6 +25,7 @@ import {
   uploadBookCover,
 } from '../services/api';
 import { chooseExportPath, openExternalLink, startDesktopBackend } from '../services/desktop';
+import { getCurrentWindow, type ResizeDirection } from '@tauri-apps/api/window';
 import brandIcon from '../../qj_icon2.png';
 import type {
   AddBookPayload,
@@ -173,6 +174,108 @@ const exportingFormat = ref<BookExportFormat | null>(null);
 const detailLoading = ref(false);
 const detailError = ref('');
 const readerTheme = ref<ReaderTheme>(readStoredReaderTheme());
+type GlobalTheme = 'system' | 'light' | 'care' | 'dark';
+
+const globalTheme = ref<GlobalTheme>(readStoredGlobalTheme());
+
+function resolveSystemGlobalTheme(): Exclude<GlobalTheme, 'system'> {
+  if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    return 'dark';
+  }
+
+  return 'light';
+}
+
+function mapReaderThemeToGlobalTheme(theme: ReaderTheme): Exclude<GlobalTheme, 'system'> {
+  if (theme === 'care') {
+    return 'care';
+  }
+
+  if (theme === 'night') {
+    return 'dark';
+  }
+
+  return 'light';
+}
+
+function mapGlobalThemeToReaderTheme(theme: GlobalTheme): ReaderTheme {
+  const resolvedTheme = theme === 'system' ? resolveSystemGlobalTheme() : theme;
+
+  if (resolvedTheme === 'care') {
+    return 'care';
+  }
+
+  if (resolvedTheme === 'dark') {
+    return 'night';
+  }
+
+  return 'default';
+}
+
+function syncGlobalTheme() {
+  if (typeof window === 'undefined') return;
+  const val = globalTheme.value;
+  window.localStorage.setItem('qingjuan.globalTheme', val);
+
+  if (val === 'care') {
+    document.documentElement.dataset.theme = 'care';
+    return;
+  }
+
+  if (val === 'dark' || (val === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.dataset.theme = 'dark';
+  } else {
+    delete document.documentElement.dataset.theme;
+  }
+}
+watch(globalTheme, syncGlobalTheme, { immediate: true });
+
+let dragScrollCleanup: (() => void) | null = null;
+function setupDragScroll() {
+  if (typeof window === 'undefined') return;
+  let isDragging = false;
+  let startY = 0;
+  let scrollTop = 0;
+
+  const handleMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('button, input, select, textarea, a, .no-drag, [data-tauri-drag-region], .desktop-drag-strip')) return;
+    
+    isDragging = true;
+    startY = e.pageY - document.documentElement.offsetTop;
+    scrollTop = window.scrollY;
+    document.body.style.cursor = 'grab';
+    document.body.style.userSelect = 'none';
+  };
+
+  const handleMouseLeaveOrUp = () => {
+    if (!isDragging) return;
+    isDragging = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  };
+
+  const handleMouseMove = (e: MouseEvent) => {
+    if (!isDragging) return;
+    e.preventDefault();
+    const y = e.pageY - document.documentElement.offsetTop;
+    const walk = y - startY;
+    window.scrollTo(0, scrollTop - walk);
+  };
+
+  window.addEventListener('mousedown', handleMouseDown);
+  window.addEventListener('mouseleave', handleMouseLeaveOrUp);
+  window.addEventListener('mouseup', handleMouseLeaveOrUp);
+  window.addEventListener('mousemove', handleMouseMove);
+
+  dragScrollCleanup = () => {
+    window.removeEventListener('mousedown', handleMouseDown);
+    window.removeEventListener('mouseleave', handleMouseLeaveOrUp);
+    window.removeEventListener('mouseup', handleMouseLeaveOrUp);
+    window.removeEventListener('mousemove', handleMouseMove);
+  };
+}
 const readerFontSize = ref<ReaderFontSize>(readStoredReaderFontSize());
 const readerTextColor = ref(readStoredReaderColor(READER_TEXT_COLOR_STORAGE_KEY));
 const readerBackgroundColor = ref(readStoredReaderColor(READER_BACKGROUND_COLOR_STORAGE_KEY));
@@ -832,6 +935,62 @@ const detailSynopsis = computed(
     selectedBook.value?.synopsis ||
     '这本书尚未写入简介，你可以在后续版本中为站点适配专属摘要提取器。',
 );
+const activeProviderOption = computed(
+  () => providerOptions.find((item) => item.key === activeProvider.value) ?? providerOptions[0],
+);
+const appHeaderMeta = computed(() => {
+  if (currentView.value === 'library') {
+    return {
+      kicker: '藏书陈列',
+      title: '青卷',
+      subtitle: `已收藏 ${books.value.length} 本作品，当前展示 ${filteredBooks.value.length} 本。`,
+    };
+  }
+
+  if (currentView.value === 'logs') {
+    return {
+      kicker: '运行台账',
+      title: '运行日志',
+      subtitle: `集中查看导入、下载、翻译与系统状态的完整轨迹，共 ${logSummary.value.total} 条记录。`,
+    };
+  }
+
+  if (currentView.value === 'settings') {
+    return {
+      kicker: '配置工作台',
+      title: '设置',
+      subtitle: `当前正在编辑 ${activeProviderOption.value.label}，用于管理翻译服务与应用偏好。`,
+    };
+  }
+
+  if (currentView.value === 'detail') {
+    const author = selectedPresentation.value?.author ? `${selectedPresentation.value.author} · ` : '';
+    return {
+      kicker: '作品详情',
+      title: selectedBook.value?.title ?? '书籍详情',
+      subtitle: `${author}${continueReadingDescription.value}`,
+    };
+  }
+
+  return {
+    kicker: '沉浸阅读',
+    title: selectedBook.value?.title ?? '阅读器',
+    subtitle: readerChapter.value?.title ?? '准备进入阅读',
+  };
+});
+const windowTitle = computed(() => {
+  if (currentView.value === 'library') {
+    return '青卷';
+  }
+
+  if (currentView.value === 'reader') {
+    const bookTitle = selectedBook.value?.title ?? '阅读器';
+    const chapterTitle = readerChapter.value?.title;
+    return chapterTitle ? `${bookTitle} · ${chapterTitle} · 青卷` : `${bookTitle} · 青卷`;
+  }
+
+  return `${appHeaderMeta.value.title} · 青卷`;
+});
 
 function readStoredReaderTheme(): ReaderTheme {
   if (typeof window === 'undefined') {
@@ -839,6 +998,19 @@ function readStoredReaderTheme(): ReaderTheme {
   }
   const stored = window.localStorage.getItem(READER_THEME_STORAGE_KEY);
   return stored === 'default' || stored === 'care' || stored === 'night' ? stored : 'default';
+}
+
+function readStoredGlobalTheme(): GlobalTheme {
+  if (typeof window === 'undefined') {
+    return mapReaderThemeToGlobalTheme(readStoredReaderTheme());
+  }
+
+  const stored = window.localStorage.getItem('qingjuan.globalTheme');
+  if (stored === 'system' || stored === 'light' || stored === 'care' || stored === 'dark') {
+    return stored;
+  }
+
+  return mapReaderThemeToGlobalTheme(readStoredReaderTheme());
 }
 
 function readStoredReaderFontSize(): ReaderFontSize {
@@ -1527,6 +1699,13 @@ function setDefaultProvider(provider: TranslationProvider) {
 
 function applyReaderTheme(theme: ReaderTheme) {
   readerTheme.value = theme;
+  globalTheme.value = mapReaderThemeToGlobalTheme(theme);
+  persistReaderPreferences();
+}
+
+function applyGlobalTheme(theme: GlobalTheme) {
+  globalTheme.value = theme;
+  readerTheme.value = mapGlobalThemeToReaderTheme(theme);
   persistReaderPreferences();
 }
 
@@ -2123,14 +2302,128 @@ watch(currentView, (value, previous) => {
   updateScrollAffordances();
 });
 
+const isTauriDesktop = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const appWindow = isTauriDesktop ? getCurrentWindow() : null;
+const windowMaximized = ref(false);
+let removeWindowResizeListener: (() => void) | null = null;
+const desktopResizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
+  { direction: 'North', className: 'desktop-resize-handle--n' },
+  { direction: 'South', className: 'desktop-resize-handle--s' },
+  { direction: 'West', className: 'desktop-resize-handle--w' },
+  { direction: 'East', className: 'desktop-resize-handle--e' },
+  { direction: 'NorthWest', className: 'desktop-resize-handle--nw' },
+  { direction: 'NorthEast', className: 'desktop-resize-handle--ne' },
+  { direction: 'SouthWest', className: 'desktop-resize-handle--sw' },
+  { direction: 'SouthEast', className: 'desktop-resize-handle--se' },
+];
+
+async function syncWindowMaximizedState() {
+  if (!appWindow) {
+    return;
+  }
+
+  try {
+    windowMaximized.value = await appWindow.isMaximized();
+  } catch (error) {
+    console.error('同步窗口最大化状态失败', error);
+  }
+}
+
+async function syncWindowTitle() {
+  if (typeof document !== 'undefined') {
+    document.title = windowTitle.value;
+  }
+
+  if (!appWindow) {
+    return;
+  }
+
+  try {
+    await appWindow.setTitle(windowTitle.value);
+  } catch (error) {
+    console.error('同步窗口标题失败', error);
+  }
+}
+
+async function runWindowControl(action: () => Promise<void>, actionLabel: string) {
+  if (!appWindow) {
+    return;
+  }
+
+  try {
+    await action();
+    await syncWindowMaximizedState();
+  } catch (error) {
+    const detail = `窗口${actionLabel}失败：${toErrorMessage(error)}`;
+    lastMessage.value = detail;
+    appendActivityLog('error', '窗口控制', detail);
+  }
+}
+
+async function minimizeWindow() {
+  await runWindowControl(() => appWindow!.minimize(), '最小化');
+}
+async function maximizeWindow() {
+  await runWindowControl(() => appWindow!.toggleMaximize(), windowMaximized.value ? '还原' : '最大化');
+}
+async function closeWindow() {
+  await runWindowControl(() => appWindow!.close(), '关闭');
+}
+
+async function startWindowDragging() {
+  if (!appWindow) {
+    return;
+  }
+
+  try {
+    await appWindow.startDragging();
+  } catch (error) {
+    const detail = `窗口拖动失败：${toErrorMessage(error)}`;
+    lastMessage.value = detail;
+    appendActivityLog('error', '窗口拖动', detail);
+  }
+}
+
+async function startWindowResizeDragging(direction: ResizeDirection) {
+  if (!appWindow || windowMaximized.value) {
+    return;
+  }
+
+  try {
+    await appWindow.startResizeDragging(direction);
+  } catch (error) {
+    const detail = `窗口边缘缩放失败：${toErrorMessage(error)}`;
+    lastMessage.value = detail;
+    appendActivityLog('error', '窗口缩放', detail);
+  }
+}
+
+watch(windowTitle, () => {
+  void syncWindowTitle();
+}, { immediate: true });
+
 onMounted(() => {
   window.addEventListener('scroll', handleWindowScroll, { passive: true });
   updateScrollAffordances();
+  setupDragScroll();
+  void syncWindowMaximizedState();
+  if (appWindow) {
+    void appWindow.onResized(() => {
+      void syncWindowMaximizedState();
+    }).then((unlisten) => {
+      removeWindowResizeListener = unlisten;
+    }).catch((error) => {
+      console.error('监听窗口尺寸变化失败', error);
+    });
+  }
   void bootstrap();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('scroll', handleWindowScroll);
+  dragScrollCleanup?.();
+  removeWindowResizeListener?.();
+  removeWindowResizeListener = null;
   void flushReaderProgressSave({ silent: true });
   clearReaderScrollSaveTimer();
   clearReaderScrollReleaseTimer();
@@ -2151,6 +2444,22 @@ onBeforeUnmount(() => {
     :data-font-size="readerFontSize"
     :style="readerCustomStyle"
   >
+    <div
+      v-if="isTauriDesktop"
+      class="desktop-drag-strip"
+      data-tauri-drag-region
+      @mousedown.prevent.stop="startWindowDragging"
+    ></div>
+
+    <div
+      v-for="handle in desktopResizeHandles"
+      v-if="isTauriDesktop"
+      :key="handle.direction"
+      class="desktop-resize-handle no-drag"
+      :class="handle.className"
+      @mousedown.prevent.stop="startWindowResizeDragging(handle.direction)"
+    ></div>
+
     <aside class="sidebar">
       <div class="brand-row">
         <div class="brand">
@@ -2159,18 +2468,7 @@ onBeforeUnmount(() => {
             alt="青卷图标"
             class="brand-mark"
           />
-          <div class="brand-copy">
-            <h1>青卷</h1>
-            <p>小说集成管理</p>
-          </div>
         </div>
-        <button
-          class="icon-btn sidebar-toggle"
-          :title="sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
-          @click="toggleSidebar"
-        >
-          {{ sidebarCollapsed ? '›' : '‹' }}
-        </button>
       </div>
 
       <nav class="sidebar-nav">
@@ -2188,145 +2486,948 @@ onBeforeUnmount(() => {
       </nav>
 
       <div class="sidebar-footer">
-        <p>{{ desktopState }}</p>
-        <span>v0.2.1</span>
+        <span>v0.3.0</span>
       </div>
     </aside>
 
+    <div v-if="isTauriDesktop" class="desktop-window-controls no-drag">
+      <button
+        class="window-control"
+        type="button"
+        aria-label="最小化窗口"
+        @mousedown.stop
+        @click.stop="minimizeWindow"
+      >
+        <span class="window-control-glyph">－</span>
+      </button>
+      <button
+        class="window-control"
+        type="button"
+        :aria-label="windowMaximized ? '还原窗口' : '最大化窗口'"
+        :title="windowMaximized ? '还原窗口' : '最大化窗口'"
+        @mousedown.stop
+        @click.stop="maximizeWindow"
+      >
+        <span class="window-control-glyph">{{ windowMaximized ? '❐' : '□' }}</span>
+      </button>
+      <button
+        class="window-control window-control--close"
+        type="button"
+        aria-label="关闭窗口"
+        @mousedown.stop
+        @click.stop="closeWindow"
+      >
+        <span class="window-control-glyph">✕</span>
+      </button>
+    </div>
+
     <section class="main-area">
-      <template v-if="currentView === 'library'">
-        <header class="page-head">
-          <div>
-            <p class="page-kicker">我的书架</p>
-            <h2>我的书架</h2>
-            <p class="page-subtitle">已收藏 {{ books.length }} 本作品</p>
-          </div>
+      <header v-if="currentView !== 'reader'" class="app-header" :data-view="currentView">
+        <div class="app-header-drag" data-tauri-drag-region>
           <button
-            class="primary-btn"
-            @click="showImportPanel = true"
-          >
-            <span>＋</span>
-            添加书籍
-          </button>
-        </header>
-
-        <section class="toolbar">
-          <label class="search-field">
-            <span>⌕</span>
-            <input
-              v-model="searchQuery"
-              placeholder="搜索书名或作者..."
-              type="text"
-            />
-          </label>
-        </section>
-
-        <section class="summary-row">
-          <article
-            v-for="item in stats"
-            :key="item.label"
-            class="summary-card"
-          >
-            <span>{{ item.label }}</span>
-            <strong>{{ item.value }}</strong>
-            <small>{{ item.suffix }}</small>
-          </article>
-
-          <button
-            class="summary-card task-overview-entry"
-            :class="{ active: tasksOverviewOpen, busy: globalActiveTasks.length > 0 }"
+            v-if="currentView === 'detail'"
+            class="text-btn app-header-back no-drag"
             type="button"
-            @click="toggleTasksOverview"
+            @click="backToLibrary"
           >
-            <span>进行中任务</span>
-            <strong>{{ globalActiveTasks.length }}</strong>
-            <small>
-              {{
-                globalFailedTasks.length > 0
-                  ? `失败 ${globalFailedTasks.length} 个，点击查看详情`
-                  : globalActiveTasks.length > 0
-                    ? '下载与翻译任务正在后台执行'
-                    : '当前没有进行中的任务'
-              }}
-            </small>
+            ‹ 返回书架
           </button>
-        </section>
-
-        <section class="library-theme-panel">
-          <div class="chapter-head library-theme-head">
-            <div>
-              <h3>应用主题</h3>
-              <p>在主页切换整个软件的主题，书架、设置、详情和阅读页会同时生效。</p>
-            </div>
-            <span class="book-state-pill">当前 {{ readerThemeLabel }} · {{ readerFontSize }}</span>
-          </div>
-
-          <div class="theme-preview-grid">
-            <button
-              v-for="theme in themeOptions"
-              :key="theme.key"
-              class="theme-preview-card"
-              :class="{ active: readerTheme === theme.key }"
-              :data-theme-key="theme.key"
-              type="button"
-              @click="applyReaderTheme(theme.key)"
+          <p v-if="appHeaderMeta.kicker" class="page-kicker">{{ appHeaderMeta.kicker }}</p>
+          <div class="app-header-title-row">
+            <h1 class="main-title" v-if="currentView === 'library'">青卷</h1>
+            <h2 v-else>{{ appHeaderMeta.title }}</h2>
+            <span
+              v-if="currentView === 'library'"
+              class="book-state-pill"
             >
-              <strong>{{ theme.label }}</strong>
-              <p>{{ theme.description }}</p>
-              <span>{{ theme.preview }}</span>
+              {{ readerThemeLabel }} · {{ readerFontSize }}
+            </span>
+            <span
+              v-else-if="currentView === 'logs'"
+              class="book-state-pill"
+            >
+              {{ logSummary.total }} 条记录
+            </span>
+            <span
+              v-else-if="currentView === 'settings'"
+              class="book-state-pill"
+            >
+              {{ activeProviderOption.label }}
+            </span>
+            <span
+              v-else-if="currentView === 'detail' && selectedBook"
+              class="book-state-pill"
+            >
+              {{ selectedBook.bookKind }} · {{ selectedBook.language }}
+            </span>
+          </div>
+          <p class="page-subtitle">{{ appHeaderMeta.subtitle }}</p>
+        </div>
+
+        <div class="app-header-actions no-drag">
+          <template v-if="currentView === 'library'">
+            <label class="search-field library-search-field app-header-search">
+              <span>⌕</span>
+              <input
+                v-model="searchQuery"
+                placeholder="搜索书名或作者..."
+                type="text"
+              />
+            </label>
+            <button
+              class="primary-btn"
+              type="button"
+              @click="showImportPanel = true"
+            >
+              添加书籍
             </button>
-          </div>
+          </template>
 
-          <div class="theme-live-preview">
-            <div class="theme-live-toolbar">
-              <span>整页预览</span>
-              <div class="theme-live-actions">
-                <button class="ghost-btn compact">原文</button>
-                <button class="ghost-btn compact active-preview-btn">译文</button>
-              </div>
-            </div>
-            <article class="theme-live-paper">
-              <h4>第一章 初识异世界</h4>
-              <p>晨雾像未翻完的书页一样铺在窗边，主角在安静的房间里重新整理思绪，准备继续读下去。</p>
-              <p>这里会实时预览当前应用主题的正文底色、文字颜色、按钮和面板层次，不再只显示按钮选中态变化。</p>
-            </article>
-          </div>
-        </section>
-
-        <transition name="panel-fade">
-          <section
-            v-if="tasksOverviewOpen"
-            class="task-overview-panel"
+          <button
+            v-if="currentView === 'logs'"
+            class="text-btn compact"
+            type="button"
+            @click="clearActivityLogs"
           >
-            <div class="chapter-head task-overview-head">
-              <div>
-                <h3>任务总览</h3>
-                <p v-if="globalTasksLoading">正在同步所有书籍的任务状态...</p>
-                <p v-else>运行中 {{ globalActiveTasks.length }} 个，失败 {{ globalFailedTasks.length }} 个</p>
+            清空日志
+          </button>
+          <button
+            v-if="currentView === 'settings'"
+            class="primary-btn"
+            :disabled="savingSettings"
+            type="button"
+            @click="handleSaveSettings"
+          >
+            {{ savingSettings ? '保存中...' : '保存设置' }}
+          </button>
+        </div>
+      </header>
+
+      <template v-if="currentView === 'library'">
+        <section class="library-view">
+          <section class="library-summary-strip">
+            <p class="library-summary-inline">
+              <span v-for="(item, index) in stats" :key="item.label">
+                {{ item.label }} <strong>{{ item.value }}</strong>
+                <template v-if="index < stats.length - 1"> &nbsp;&nbsp;|&nbsp;&nbsp; </template>
+              </span>
+              &nbsp;&nbsp;|&nbsp;&nbsp;
+              进行中任务 <strong>{{ globalActiveTasks.length }}</strong>
+            </p>
+            <button
+              class="text-btn task-insight-btn"
+              type="button"
+              @click="toggleTasksOverview"
+            >
+              视图详情 ›
+            </button>
+          </section>
+
+          <transition name="panel-fade">
+            <section
+              v-if="tasksOverviewOpen"
+              class="task-overview-panel"
+            >
+              <div class="chapter-head task-overview-head">
+                <div>
+                  <h3>任务总览</h3>
+                  <p v-if="globalTasksLoading">正在同步所有书籍的任务状态...</p>
+                  <p v-else>运行中 {{ globalActiveTasks.length }} 个，失败 {{ globalFailedTasks.length }} 个</p>
+                </div>
+                <button
+                  class="ghost-btn compact"
+                  type="button"
+                  @click="tasksOverviewOpen = false"
+                >
+                  收起
+                </button>
               </div>
-              <button
-                class="ghost-btn compact"
-                type="button"
-                @click="tasksOverviewOpen = false"
+
+              <div
+                v-if="!tasksOverviewItems.length"
+                class="status-note flush"
               >
-                收起
-              </button>
+                <strong>暂无任务</strong>
+                <p>下载和翻译任务开始后，这里会汇总显示所有进行中与历史结果。</p>
+              </div>
+
+              <div
+                v-else
+                class="task-list task-list-compact"
+              >
+                <article
+                  v-for="task in tasksOverviewItems"
+                  :key="task.id"
+                  class="task-row"
+                >
+                  <div class="task-copy">
+                    <div class="task-meta">
+                      <strong>{{ taskTypeLabel(task) }}</strong>
+                      <span :data-task-status="task.status">{{ taskStatusLabel(task.status) }}</span>
+                    </div>
+                    <p>{{ taskBookTitle(task) }}</p>
+                    <small>{{ task.message || '等待任务状态更新' }}</small>
+                    <small>章节 {{ task.completedCount }} / {{ task.totalCount }}</small>
+                    <small v-if="task.error">{{ task.error }}</small>
+                  </div>
+
+                  <div class="task-side">
+                    <div class="task-progress">
+                      <div
+                        class="task-progress-fill"
+                        :style="{ width: `${task.progress}%` }"
+                      ></div>
+                    </div>
+
+                    <div class="task-actions">
+                      <button
+                        class="ghost-btn compact"
+                        type="button"
+                        @click="openTaskBook(task)"
+                      >
+                        查看书籍
+                      </button>
+                      <button
+                        v-if="task.status === 'failed'"
+                        class="ghost-btn compact"
+                        :disabled="taskRetryingId === task.id"
+                        type="button"
+                        @click="handleRetryTask(task.id)"
+                      >
+                        {{ taskRetryingId === task.id ? '重试中...' : '失败重试' }}
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </transition>
+
+          <section class="books-grid books-grid--atelier">
+            <article
+              v-for="book in filteredBooks"
+              :key="book.id"
+              class="shelf-card"
+              @click="openBook(book.id)"
+            >
+              <div
+                class="cover-art"
+                :class="getCoverClass(book)"
+              >
+                <img
+                  v-if="book.cover"
+                  :src="book.cover"
+                  :alt="`${book.title} 封面`"
+                  class="cover-image"
+                  loading="lazy"
+                />
+                <div
+                  v-if="book.cover"
+                  class="cover-filter"
+                ></div>
+                <div
+                  v-else
+                  class="cover-glow"
+                ></div>
+                <div class="cover-caption">
+                  <span>{{ book.language }}</span>
+                  <strong>{{ book.title }}</strong>
+                </div>
+              </div>
+
+              <div class="card-body">
+                <h3>{{ book.title }}</h3>
+                <p class="author-line">{{ getPresentation(book).author }}</p>
+
+                <div class="book-tags">
+                  <span>{{ book.bookKind }}</span>
+                  <span>{{ book.language }}</span>
+                  <span v-if="book.translated">翻译中</span>
+                </div>
+
+                <p
+                  v-if="book.lastReadChapterIndex > 0"
+                  class="card-reading"
+                >
+                  上次读到第 {{ book.lastReadChapterIndex }} 章
+                </p>
+
+                <div class="progress-meta">
+                  <span>{{ book.lastReadChapterIndex > 0 ? '阅读进度' : '进度' }}</span>
+                  <strong>
+                    {{
+                      book.lastReadChapterIndex > 0
+                        ? `${book.lastReadChapterIndex} / ${book.chapterCount}`
+                        : `${book.chapterCount} / ${book.chapterCount}`
+                    }}
+                  </strong>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          <transition name="panel-fade">
+            <section
+              v-if="showImportPanel"
+              class="drawer-mask"
+              @click.self="showImportPanel = false"
+            >
+              <div class="import-drawer">
+                <div class="drawer-head">
+                  <div>
+                    <p class="page-kicker">添加书籍</p>
+                    <h3>导入新内容</h3>
+                  </div>
+                  <button
+                    class="icon-btn"
+                    @click="showImportPanel = false"
+                  >
+                    ×
+                  </button>
+                </div>
+
+                <label class="form-field">
+                  <span>内容链接</span>
+                  <input
+                    v-model="addBookForm.sourceUrl"
+                    placeholder="https://example.com/novel/123 或漫画详情页链接"
+                    type="url"
+                  />
+                  <small class="field-hint">
+                    已支持自动识别小说 / 漫画；漫画目前支持 18comic.vip 与 bikawebapp.com。
+                  </small>
+                </label>
+
+                <label class="form-field">
+                  <span>本地小说文件</span>
+                  <input
+                    :key="localFilePickerKey"
+                    accept=".txt,.text,.md"
+                    type="file"
+                    @change="handleLocalFileChange"
+                  />
+                  <small class="field-hint">
+                    支持导入本地 TXT / TEXT / Markdown 文本，系统会自动尝试拆分章节。
+                  </small>
+                  <strong
+                    v-if="localBookFile"
+                    class="file-picked"
+                  >
+                    已选择：{{ localBookFile.name }}
+                  </strong>
+                </label>
+
+                <div class="field-grid">
+                  <label class="form-field">
+                    <span>内容类型</span>
+                    <select v-model="addBookForm.bookKind">
+                      <option value="长小说">长小说</option>
+                      <option value="轻小说">轻小说</option>
+                      <option value="漫画">漫画</option>
+                    </select>
+                    <small class="field-hint">远程链接会自动识别，手动选择主要用于本地导入。</small>
+                  </label>
+
+                  <label class="form-field">
+                    <span>语言</span>
+                    <select v-model="addBookForm.language">
+                      <option value="中文">中文</option>
+                      <option value="英文">英文</option>
+                      <option value="日文">日文</option>
+                    </select>
+                  </label>
+                </div>
+
+                <label class="form-field">
+                  <span>书名（可选）</span>
+                  <input
+                    v-model="addBookForm.title"
+                    placeholder="允许留空，抓取后自动识别"
+                    type="text"
+                  />
+                </label>
+
+                <label class="check-line">
+                  <input
+                    v-model="addBookForm.needTranslation"
+                    type="checkbox"
+                  />
+                  <span>抓取完成后自动进入 AI 翻译流程</span>
+                </label>
+
+                <div class="drawer-actions">
+                  <button
+                    class="ghost-btn"
+                    :disabled="loadingPreview"
+                    @click="handlePreview"
+                  >
+                    {{ loadingPreview ? '解析中...' : '预览章节' }}
+                  </button>
+                  <button
+                    class="primary-btn"
+                    :disabled="importing"
+                    @click="handleImport"
+                  >
+                    {{ importing ? '导入中...' : '加入书架' }}
+                  </button>
+                </div>
+
+                <div class="drawer-actions drawer-actions--local">
+                  <button
+                    class="secondary-btn"
+                    :disabled="importing || !localBookFile"
+                    @click="handleImportLocal"
+                  >
+                    {{ importing ? '导入中...' : '导入本地文件' }}
+                  </button>
+                </div>
+
+                <div class="status-note">
+                  <strong>状态</strong>
+                  <p>{{ lastMessage }}</p>
+                </div>
+
+                <div
+                  v-if="preview"
+                  class="preview-panel"
+                >
+                  <div class="preview-top">
+                    <div>
+                      <span class="page-kicker">抓取预览</span>
+                      <h4>{{ preview.title }}</h4>
+                    </div>
+                    <strong>{{ preview.bookKind }} · {{ formatChapterCount(preview.chapterCount, preview.bookKind) }}</strong>
+                  </div>
+                  <p>{{ preview.synopsis }}</p>
+                  <ul>
+                    <li
+                      v-for="chapter in preview.chapters.slice(0, 6)"
+                      :key="chapter.url"
+                    >
+                      {{ chapter.title }}
+                      <small v-if="preview.bookKind === '漫画' && chapter.pageCount > 0">（{{ formatPageCount(chapter.pageCount) }}）</small>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </section>
+          </transition>
+
+        </section>
+      </template>
+
+      <template v-else-if="currentView === 'logs'">
+        <section class="logs-view">
+          <section class="logs-table-panel">
+            <div class="logs-table-head">
+              <span>时间</span>
+              <span>内容</span>
+              <span>记录</span>
             </div>
 
             <div
-              v-if="!tasksOverviewItems.length"
+              v-if="!activityLogs.length"
               class="status-note flush"
             >
-              <strong>暂无任务</strong>
-              <p>下载和翻译任务开始后，这里会汇总显示所有进行中与历史结果。</p>
+              <strong>暂无日志</strong>
+              <p>导入小说、下载章节、翻译任务或系统状态变化后，这里会显示完整记录。</p>
             </div>
 
             <div
               v-else
-              class="task-list task-list-compact"
+              class="logs-table-body"
             >
               <article
-                v-for="task in tasksOverviewItems"
+                v-for="entry in activityLogs"
+                :key="entry.id"
+                class="logs-table-row"
+                :data-log-category="entry.category"
+              >
+                <time>{{ entry.at }}</time>
+                <span class="logs-table-category">{{ logCategoryLabel(entry.category) }}</span>
+                <div class="logs-table-content">
+                  <strong class="logs-table-title">{{ entry.title }}</strong>
+                  <p
+                    v-if="entry.detail && entry.detail !== entry.title"
+                    class="logs-table-detail"
+                  >
+                    {{ entry.detail }}
+                  </p>
+                </div>
+              </article>
+            </div>
+          </section>
+        </section>
+      </template>
+
+      <template v-else-if="currentView === 'settings'">
+        <section class="settings-view">
+          <section class="settings-panel">
+            <div class="settings-section-head">
+              <div>
+                <h3>界面主题</h3>
+                <p>全局亮色或深色，或是跟随您的操作系统设置。</p>
+              </div>
+            </div>
+            <div class="theme-stack">
+              <button
+                v-for="opt in [{key:'light',label:'清亮'}, {key:'care',label:'护眼模式'}, {key:'dark',label:'深邃沉浸'}, {key:'system',label:'跟随系统'}]"
+                :key="opt.key"
+                class="ghost-btn compact"
+                :class="{ activePreviewBtn: globalTheme === opt.key }"
+                type="button"
+                @click="applyGlobalTheme(opt.key as GlobalTheme)"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </section>
+
+          <section class="settings-panel settings-panel--translation">
+            <div class="settings-section-head">
+              <div>
+                <h3>AI 配置</h3>
+                <p>左侧切换服务提供商，右侧集中编辑当前提供商的地址、模型和启用状态。</p>
+              </div>
+            </div>
+
+            <div class="settings-provider-layout">
+              <div class="provider-list">
+                <button
+                  v-for="provider in providerOptions"
+                  :key="provider.key"
+                  :class="[providerCardClass(provider.key), 'provider-option--row']"
+                  @click="setDefaultProvider(provider.key)"
+                >
+                  <strong>{{ provider.label }}</strong>
+                  <span>{{ provider.description }}</span>
+                </button>
+              </div>
+
+              <div class="settings-provider-form">
+                <label class="form-field">
+                  <span>API 密钥</span>
+                  <input
+                    v-model="settings.providers[activeProvider].apiKey"
+                    placeholder="sk-..."
+                    type="password"
+                  />
+                  <small>您的 API 密钥将加密保存在本地，不会上传到服务器。</small>
+                </label>
+
+                <label class="form-field">
+                  <span>API 地址</span>
+                  <input
+                    v-model="settings.providers[activeProvider].baseUrl"
+                    placeholder="https://api.openai.com/v1"
+                    type="text"
+                  />
+                </label>
+
+                <label class="form-field">
+                  <span>翻译模型</span>
+                  <input
+                    v-model="settings.providers[activeProvider].model"
+                    :list="`${activeProvider}-model-options`"
+                    placeholder="输入模型名，例如 gpt-5.4"
+                    type="text"
+                  />
+                  <datalist :id="`${activeProvider}-model-options`">
+                    <option
+                      v-for="option in providerModelOptions"
+                      :key="option"
+                      :value="option"
+                    />
+                  </datalist>
+                  <small>可直接输入任意模型名，建议项仅用于快速填写。</small>
+                </label>
+
+                <label class="check-line">
+                  <input
+                    v-model="settings.providers[activeProvider].enabled"
+                    type="checkbox"
+                  />
+                  <span>启用当前提供商</span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel settings-panel--application">
+            <div class="settings-section-head">
+              <div>
+                <h3>界面与抓取设置</h3>
+                <p>应用级偏好与漫画凭证放在同一个分组下，便于统一维护。</p>
+              </div>
+            </div>
+
+            <div class="settings-application-grid">
+              <label class="form-field">
+                <span>默认翻译服务</span>
+                <select v-model="settings.defaultProvider">
+                  <option
+                    v-for="provider in providerOptions"
+                    :key="provider.key"
+                    :value="provider.key"
+                  >
+                    {{ provider.label }}
+                  </option>
+                </select>
+              </label>
+
+              <label class="form-field">
+                <span>阅读时预翻译后续章节</span>
+                <select v-model.number="settings.autoTranslateNextChapters">
+                  <option
+                    v-for="option in autoTranslateOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+                <small>会自动把当前章和后续设定章数加入翻译队列。</small>
+              </label>
+
+              <label class="form-field">
+                <span>下载线程数</span>
+                <input
+                  v-model.number="settings.downloadConcurrency"
+                  min="1"
+                  max="8"
+                  step="1"
+                  type="number"
+                />
+                <small>建议设置 2-5；过高并发可能触发目标站点限流。</small>
+              </label>
+
+              <div class="status-note flush">
+                <strong>Bika 漫画凭证</strong>
+                <p>用于抓取 bikawebapp.com 对应的漫画目录和章节图片；留空时会在首次抓取时自动创建并登录本地账户。</p>
+              </div>
+
+              <label class="form-field">
+                <span>Bika 账号</span>
+                <input
+                  v-model="settings.bika.email"
+                  placeholder="留空则自动创建，或输入已有邮箱/用户名"
+                  type="text"
+                />
+              </label>
+
+              <label class="form-field">
+                <span>Bika 密码</span>
+                <input
+                  v-model="settings.bika.password"
+                  placeholder="留空则自动创建，或输入已有账户密码"
+                  type="password"
+                />
+              </label>
+
+              <label class="form-field settings-system-prompt">
+                <span>系统提示词</span>
+                <textarea
+                  v-model="settings.systemPrompt"
+                  rows="6"
+                ></textarea>
+              </label>
+            </div>
+
+            <div class="settings-footer">
+              <div class="status-note flush">
+                <strong>桌面状态</strong>
+                <p>{{ desktopState }}</p>
+              </div>
+
+              <button
+                class="primary-btn"
+                :disabled="savingSettings"
+                @click="handleSaveSettings"
+              >
+                {{ savingSettings ? '保存中...' : '保存设置' }}
+              </button>
+            </div>
+          </section>
+        </section>
+      </template>
+
+      <template v-else-if="currentView === 'detail' && selectedBook && selectedPresentation">
+        <section class="detail-view">
+          <section class="detail-hero detail-hero--atelier">
+            <div
+              class="detail-cover"
+              :class="getCoverClass(selectedBook)"
+            >
+              <img
+                v-if="selectedBook.cover"
+                :src="selectedBook.cover"
+                :alt="`${selectedBook.title} 封面`"
+                class="cover-image"
+              />
+              <div
+                v-if="selectedBook.cover"
+                class="cover-filter"
+              ></div>
+              <div
+                v-else
+                class="cover-glow"
+              ></div>
+              <div class="cover-caption">
+                <span>{{ selectedBook.language }}</span>
+                <strong>{{ selectedBook.title }}</strong>
+              </div>
+              <input
+                :key="coverUploadPickerKey"
+                ref="coverFileInput"
+                class="cover-upload-input"
+                accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                type="file"
+                @change="handleCoverFileChange"
+              />
+              <button
+                class="cover-upload-trigger"
+                type="button"
+                :disabled="coverUploading"
+                @click="triggerCoverUpload"
+              >
+                {{ coverUploading ? '上传中...' : '更换封面' }}
+              </button>
+            </div>
+
+            <div class="detail-copy">
+              <h2>{{ selectedBook.title }}</h2>
+              <p class="detail-author">作者：{{ selectedPresentation.author }}</p>
+
+              <div class="book-tags">
+                <span>{{ selectedBook.bookKind }}</span>
+                <span>{{ selectedBook.language }}</span>
+                <span :class="selectedPresentation.accentClass">{{ selectedPresentation.serialState }}</span>
+              </div>
+
+              <div class="detail-stats">
+                <article>
+                  <span>{{ selectedBook.bookKind === '漫画' ? '总话数' : '总章节' }}</span>
+                  <strong>{{ selectedPresentation.progressTotal }}</strong>
+                </article>
+                <article>
+                  <span>阅读进度</span>
+                  <strong>
+                    {{
+                      persistedReadingProgress.hasProgress
+                        ? `${persistedReadingProgress.currentIndex} / ${selectedPresentation.progressTotal}`
+                        : '未开始'
+                    }}
+                  </strong>
+                  <small v-if="persistedReadingProgress.lastReadAt">{{ formatReadingTimestamp(persistedReadingProgress.lastReadAt) }}</small>
+                </article>
+                <article>
+                  <span>{{ selectedBook.bookKind === '漫画' ? '总页数' : '总字数' }}</span>
+                  <strong>{{ formatContentCount(Number(selectedPresentation.words), selectedBook.bookKind) }}</strong>
+                </article>
+                <article>
+                  <span>添加日期</span>
+                  <strong>{{ selectedPresentation.addedAt }}</strong>
+                </article>
+              </div>
+
+              <p class="detail-summary">
+                {{ detailSynopsis }}
+              </p>
+
+              <div class="detail-actions">
+                <div class="detail-continue">
+                  <button
+                    class="primary-btn"
+                    :disabled="!chapters.length"
+                    @click="handleContinueReading"
+                  >
+                    ▶ {{ continueReadingLabel }}
+                  </button>
+                  <small>{{ continueReadingDescription }}</small>
+                </div>
+                <button
+                  class="ghost-btn anchor-btn"
+                  :disabled="!selectedBook.sourceUrl"
+                  @click="handleOpenExternal(selectedBook.sourceUrl, '原帖')"
+                >
+                  ↗ 访问原帖
+                </button>
+                <div class="export-menu">
+                  <button
+                    class="ghost-btn"
+                    :disabled="!chapters.length || exportingFormat !== null"
+                    @click="toggleExportMenu"
+                  >
+                    {{ exportingFormat ? `${exportingFormat.toUpperCase()} 导出中...` : exportMenuOpen ? '收起导出' : '导出' }}
+                  </button>
+                  <div
+                    v-if="exportMenuOpen"
+                    class="export-submenu"
+                  >
+                    <button
+                      class="ghost-btn compact"
+                      :disabled="exportingFormat !== null"
+                      @click="handleExportBook('txt')"
+                    >
+                      TXT 文本
+                    </button>
+                    <button
+                      class="ghost-btn compact"
+                      :disabled="exportingFormat !== null"
+                      @click="handleExportBook('epub')"
+                    >
+                      EPUB 电子书
+                    </button>
+                    <span class="export-hint">导出时可自由选择保存位置</span>
+                  </div>
+                </div>
+                <button
+                  class="ghost-btn"
+                  :disabled="coverUploading || exportingFormat !== null"
+                  @click="triggerCoverUpload"
+                >
+                  {{ coverUploading ? '封面上传中...' : '自定义封面' }}
+                </button>
+                <button
+                  class="danger-btn"
+                  :disabled="deletingBook || exportingFormat !== null"
+                  @click="handleDeleteSelectedBook"
+                >
+                  {{ deletingBook ? '删除中...' : '删除书籍' }}
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="chapter-card">
+            <div class="chapter-head">
+              <div>
+                <h3>章节列表</h3>
+                <p v-if="detailLoading">正在读取本地章节...</p>
+                <p v-else>
+                  已选择 {{ selectedChapterCount }} {{ selectedBook.bookKind === '漫画' ? '话' : '章' }}，共
+                  {{ chapters.length }} {{ selectedBook.bookKind === '漫画' ? '话' : '章' }}
+                </p>
+              </div>
+              <div
+                v-if="chapters.length"
+                class="chapter-tools"
+              >
+                <button
+                  class="text-btn"
+                  @click="toggleAllChapters"
+                >
+                  {{ allChaptersSelected ? '取消全选' : '全选' }}
+                </button>
+                <button
+                  class="primary-btn soft"
+                  :disabled="!chapters.length"
+                  @click="handleReadSelectedChapter"
+                >
+                  阅读当前章
+                </button>
+                <button
+                  class="ghost-btn compact"
+                  :disabled="chapterActionLoading === 'translate' || selectedChapterCount === 0"
+                  @click="handleDownloadSelected"
+                >
+                  {{ chapterActionLoading === 'download' ? '下载中...' : `下载选中 (${selectedChapterCount})` }}
+                </button>
+                <button
+                  class="ghost-btn compact"
+                  :disabled="chapterActionLoading === 'download' || selectedChapterCount === 0"
+                  @click="handleTranslateSelected"
+                >
+                  {{ chapterActionLoading === 'translate' ? '翻译中...' : `翻译选中 (${selectedChapterCount})` }}
+                </button>
+                <span class="chapter-inline-note">当前下载线程：{{ settings.downloadConcurrency }}</span>
+              </div>
+            </div>
+
+            <div
+              v-if="detailLoading"
+              class="status-note flush"
+            >
+              <strong>同步中</strong>
+              <p>正在读取本地章节文件和书籍目录清单...</p>
+            </div>
+
+            <div
+              v-else-if="detailError"
+              class="status-note flush"
+            >
+              <strong>加载失败</strong>
+              <p>{{ detailError }}</p>
+              <button
+                class="ghost-btn"
+                @click="selectedBookId && openBook(selectedBookId)"
+              >
+                重新读取
+              </button>
+            </div>
+
+            <div
+              v-else-if="!chapters.length"
+              class="status-note flush"
+            >
+              <strong>暂无章节</strong>
+              <p>当前书籍目录里还没有可读取的章节文件。</p>
+            </div>
+
+            <div
+              v-else
+              class="chapter-list"
+            >
+              <label
+                v-for="chapter in chapters"
+                :key="chapter.id"
+                class="chapter-row"
+                :class="{ active: chapter.index === activeChapterIndex }"
+                @click="setActiveChapter(chapter.index)"
+              >
+                <input
+                  v-model="selectedChapterIndexes"
+                  :value="chapter.index"
+                  type="checkbox"
+                  @click.stop
+                />
+                <div class="chapter-copy">
+                  <strong>{{ chapter.title }}</strong>
+                  <span>{{ formatChapterMeta(chapter, selectedBook.bookKind) }}</span>
+                </div>
+                <div class="chapter-flags">
+                  <em v-if="selectedBook.bookKind === '漫画' && chapter.pageCount > 0">{{ formatPageCount(chapter.pageCount) }}</em>
+                  <em v-if="chapter.illustration">插图</em>
+                  <em v-if="chapter.downloaded">已下载</em>
+                  <em v-if="chapter.translated">已翻译</em>
+                </div>
+              </label>
+            </div>
+          </section>
+
+          <section class="chapter-card task-card">
+            <div class="chapter-head">
+              <div>
+                <h3>任务队列</h3>
+                <p v-if="tasksLoading">正在同步任务状态...</p>
+                <p v-else>运行中 {{ activeTasks.length }} 个，失败 {{ failedTasks.length }} 个</p>
+              </div>
+            </div>
+
+            <div
+              v-if="!bookTasks.length"
+              class="status-note flush"
+            >
+              <strong>暂无任务</strong>
+              <p>下载和翻译任务会显示在这里，并持续更新进度。</p>
+            </div>
+
+            <div
+              v-else
+              class="task-list"
+            >
+              <article
+                v-for="task in bookTasks"
                 :key="task.id"
                 class="task-row"
               >
@@ -2335,8 +3436,7 @@ onBeforeUnmount(() => {
                     <strong>{{ taskTypeLabel(task) }}</strong>
                     <span :data-task-status="task.status">{{ taskStatusLabel(task.status) }}</span>
                   </div>
-                  <p>{{ taskBookTitle(task) }}</p>
-                  <small>{{ task.message || '等待任务状态更新' }}</small>
+                  <p>{{ task.message || '等待任务状态更新' }}</p>
                   <small>章节 {{ task.completedCount }} / {{ task.totalCount }}</small>
                   <small v-if="task.error">{{ task.error }}</small>
                 </div>
@@ -2348,1089 +3448,308 @@ onBeforeUnmount(() => {
                       :style="{ width: `${task.progress}%` }"
                     ></div>
                   </div>
-
-                  <div class="task-actions">
-                    <button
-                      class="ghost-btn compact"
-                      type="button"
-                      @click="openTaskBook(task)"
-                    >
-                      查看书籍
-                    </button>
-                    <button
-                      v-if="task.status === 'failed'"
-                      class="ghost-btn compact"
-                      :disabled="taskRetryingId === task.id"
-                      type="button"
-                      @click="handleRetryTask(task.id)"
-                    >
-                      {{ taskRetryingId === task.id ? '重试中...' : '失败重试' }}
-                    </button>
-                  </div>
+                  <button
+                    v-if="task.status === 'failed'"
+                    class="ghost-btn compact"
+                    :disabled="taskRetryingId === task.id"
+                    @click="handleRetryTask(task.id)"
+                  >
+                    {{ taskRetryingId === task.id ? '重试中...' : '失败重试' }}
+                  </button>
                 </div>
               </article>
             </div>
           </section>
-        </transition>
-
-        <section class="books-grid">
-          <article
-            v-for="book in filteredBooks"
-            :key="book.id"
-            class="shelf-card"
-            @click="openBook(book.id)"
-          >
-            <div
-              class="cover-art"
-              :class="getCoverClass(book)"
-            >
-              <img
-                v-if="book.cover"
-                :src="book.cover"
-                :alt="`${book.title} 封面`"
-                class="cover-image"
-                loading="lazy"
-              />
-              <div
-                v-if="book.cover"
-                class="cover-filter"
-              ></div>
-              <div
-                v-else
-                class="cover-glow"
-              ></div>
-              <div class="cover-caption">
-                <span>{{ book.language }}</span>
-                <strong>{{ book.title }}</strong>
-              </div>
-            </div>
-
-            <div class="card-body">
-              <h3>{{ book.title }}</h3>
-              <p class="author-line">{{ getPresentation(book).author }}</p>
-
-              <div class="book-tags">
-                <span>{{ book.bookKind }}</span>
-                <span>{{ book.language }}</span>
-                <span v-if="book.translated">翻译中</span>
-              </div>
-
-              <p
-                v-if="book.lastReadChapterIndex > 0"
-                class="card-reading"
-              >
-                上次读到第 {{ book.lastReadChapterIndex }} 章
-              </p>
-
-              <div class="progress-meta">
-                <span>{{ book.lastReadChapterIndex > 0 ? '阅读进度' : '章节数量' }}</span>
-                <strong>
-                  {{
-                    book.lastReadChapterIndex > 0
-                      ? `${book.lastReadChapterIndex} / ${book.chapterCount}`
-                      : `${book.chapterCount} / ${book.chapterCount}`
-                  }}
-                </strong>
-              </div>
-              <div class="progress-track">
-                <div
-                  class="progress-bar"
-                  :style="{ width: `${book.chapterCount ? ((book.lastReadChapterIndex || book.chapterCount) / book.chapterCount) * 100 : 0}%` }"
-                ></div>
-              </div>
-            </div>
-          </article>
         </section>
+      </template>
 
-        <transition name="panel-fade">
-          <section
-            v-if="showImportPanel"
-            class="drawer-mask"
-            @click.self="showImportPanel = false"
-          >
-            <div class="import-drawer">
-              <div class="drawer-head">
+      <template v-else-if="currentView === 'reader' && selectedBook && selectedPresentation">
+        <section class="reader-view">
+          <header class="reader-topbar">
+            <div class="reader-topbar-leading no-drag">
+              <button
+                class="text-btn app-header-back"
+                @click="backToDetail"
+              >
+                ‹ 返回详情
+              </button>
+            </div>
+
+            <div class="reader-topbar-drag" data-tauri-drag-region>
+              <div class="reader-title">
+                <strong>{{ selectedBook.title }}</strong>
+                <span>{{ readerChapter?.title || '未选择章节' }}</span>
+              </div>
+            </div>
+
+            <div class="reader-tools no-drag">
+              <button
+                class="ghost-btn compact"
+                :disabled="!readerSourceUrl"
+                @click="handleOpenExternal(readerSourceUrl, '章节原帖')"
+              >
+                原帖
+              </button>
+              <button
+                class="ghost-btn compact"
+                :disabled="!chapters.length"
+                @click="readerChapterPickerOpen = !readerChapterPickerOpen"
+              >
+                {{ readerChapterPickerOpen ? '收起章节' : '章节选择' }}
+              </button>
+              <button
+                class="ghost-btn compact"
+                :disabled="!translatedReadable"
+                @click="toggleReaderMode"
+              >
+                {{ readerMode === 'translated' ? (isComicBook ? '原图' : '原文') : '译文' }}
+              </button>
+              <button
+                class="ghost-btn compact"
+                :disabled="!hasPreviousChapter"
+                @click="goToAdjacentChapter(-1)"
+              >
+                {{ isComicBook ? '上一话' : '上一章' }}
+              </button>
+              <button
+                class="ghost-btn compact"
+                :disabled="!hasNextChapter"
+                @click="goToAdjacentChapter(1)"
+              >
+                {{ isComicBook ? '下一话' : '下一章' }}
+              </button>
+              <button
+                class="icon-btn"
+                @click="showReaderPanel = !showReaderPanel"
+              >
+                ⚙
+              </button>
+            </div>
+          </header>
+
+          <div class="reader-progress">
+            <span>{{ isComicBook ? '话数' : '章节' }} {{ readerProgressIndex }} / {{ readerProgressTotal }}</span>
+            <span>{{ formatContentCount(readerWordCount, selectedBook.bookKind) }}</span>
+            <div class="reader-line">
+              <div
+                class="reader-line-fill"
+                :style="{ width: `${readerProgressTotal ? (readerProgressIndex / readerProgressTotal) * 100 : 0}%` }"
+              ></div>
+            </div>
+          </div>
+
+          <transition name="panel-fade">
+            <section
+              v-if="readerChapterPickerOpen"
+              class="reader-chapter-picker"
+            >
+              <div class="reader-chapter-picker-head">
                 <div>
-                  <p class="page-kicker">添加书籍</p>
-                  <h3>导入新内容</h3>
+                  <strong>章节选择</strong>
+                  <p>{{ readerChapterPickerSummary }}</p>
                 </div>
                 <button
+                  class="ghost-btn compact"
+                  @click="readerChapterPickerOpen = false"
+                >
+                  收起
+                </button>
+              </div>
+              <div class="reader-chapter-picker-list">
+                <button
+                  v-for="chapter in chapters"
+                  :key="chapter.id"
+                  class="reader-chapter-chip"
+                  :class="{
+                    active: chapter.index === activeChapterIndex,
+                    progress: persistedReadingProgress.currentIndex > 0 && chapter.index === persistedReadingProgress.currentIndex,
+                  }"
+                  @click="selectReaderChapter(chapter.index)"
+                >
+                  <span>{{ chapter.title || formatChapterOrder(chapter.index, selectedBook.bookKind) }}</span>
+                  <small>{{ formatChapterMeta(chapter, selectedBook.bookKind) }}</small>
+                </button>
+              </div>
+            </section>
+          </transition>
+
+          <section
+            class="reader-layout"
+            :class="{ 'reader-layout--focus': !showReaderPanel }"
+          >
+            <article
+              ref="readerPaperRef"
+              class="reader-paper"
+            >
+              <template v-if="readerLoading">
+                <h2>{{ readerChapter?.title || '正在加载章节' }}</h2>
+                <p>正在从本地章节文件读取正文...</p>
+              </template>
+
+              <template v-else-if="readerError">
+                <h2>{{ readerChapter?.title || '章节加载失败' }}</h2>
+                <p>{{ readerError }}</p>
+              </template>
+
+              <template v-else-if="readerContent">
+                <h2>{{ readerContent.chapter.title }}</h2>
+                <div
+                  v-if="readerImages.length"
+                  class="reader-illustrations"
+                >
+                  <figure
+                    v-for="(imageSource, index) in readerImages"
+                    :key="`${readerContent.chapter.id}-image-${index}`"
+                    class="reader-figure"
+                    data-reader-anchor-type="image"
+                    :data-reader-anchor-index="index"
+                  >
+                    <img
+                      :src="imageSource"
+                      :alt="`${readerContent.chapter.title} 插图 ${index + 1}`"
+                      @load="handleReaderAssetLoad"
+                      @error="handleReaderAssetLoad"
+                    />
+                    <figcaption>{{ isComicBook ? `第 ${index + 1} 页` : `插图 ${index + 1}` }}</figcaption>
+                    <div
+                      v-if="isComicBook && readerMode === 'translated' && !readerUsesTranslatedImages && readerPageTranslations[index]"
+                      class="reader-page-translation"
+                    >
+                      <strong>本页译文</strong>
+                      <p class="reader-page-translation-text">{{ readerPageTranslations[index] }}</p>
+                    </div>
+                  </figure>
+                </div>
+                <template v-if="!isComicBook">
+                  <p
+                    v-for="(paragraph, index) in visibleReaderParagraphs"
+                    :key="`${readerContent.chapter.id}-${index}`"
+                    data-reader-anchor-type="paragraph"
+                    :data-reader-anchor-index="index"
+                  >
+                    {{ paragraph }}
+                  </p>
+                </template>
+                <div
+                  v-else-if="readerMode === 'translated' && !readerUsesTranslatedImages && !readerPageTranslations.length && visibleReaderParagraphs.length"
+                  class="reader-comic-fallback"
+                >
+                  <strong>整话译文</strong>
+                  <p
+                    v-for="(paragraph, index) in visibleReaderParagraphs"
+                    :key="`${readerContent.chapter.id}-fallback-${index}`"
+                    data-reader-anchor-type="paragraph"
+                    :data-reader-anchor-index="index"
+                  >
+                    {{ paragraph }}
+                  </p>
+                </div>
+              </template>
+
+              <template v-else>
+                <h2>{{ readerChapter?.title || '暂无章节' }}</h2>
+                <p>当前没有可读取的章节内容。</p>
+              </template>
+            </article>
+
+            <aside
+              v-if="showReaderPanel"
+              class="reader-panel"
+            >
+              <div class="reader-panel-head">
+                <h3>阅读设置</h3>
+                <button
                   class="icon-btn"
-                  @click="showImportPanel = false"
+                  @click="showReaderPanel = false"
                 >
                   ×
                 </button>
               </div>
 
-              <label class="form-field">
-                <span>内容链接</span>
-                <input
-                  v-model="addBookForm.sourceUrl"
-                  placeholder="https://example.com/novel/123 或漫画详情页链接"
-                  type="url"
-                />
-                <small class="field-hint">
-                  已支持自动识别小说 / 漫画；漫画目前支持 18comic.vip 与 bikawebapp.com。
-                </small>
-              </label>
-
-              <label class="form-field">
-                <span>本地小说文件</span>
-                <input
-                  :key="localFilePickerKey"
-                  accept=".txt,.text,.md"
-                  type="file"
-                  @change="handleLocalFileChange"
-                />
-                <small class="field-hint">
-                  支持导入本地 TXT / TEXT / Markdown 文本，系统会自动尝试拆分章节。
-                </small>
-                <strong
-                  v-if="localBookFile"
-                  class="file-picked"
-                >
-                  已选择：{{ localBookFile.name }}
-                </strong>
-              </label>
-
-              <div class="field-grid">
-                <label class="form-field">
-                  <span>内容类型</span>
-                  <select v-model="addBookForm.bookKind">
-                    <option value="长小说">长小说</option>
-                    <option value="轻小说">轻小说</option>
-                    <option value="漫画">漫画</option>
-                  </select>
-                  <small class="field-hint">远程链接会自动识别，手动选择主要用于本地导入。</small>
-                </label>
-
-                <label class="form-field">
-                  <span>语言</span>
-                  <select v-model="addBookForm.language">
-                    <option value="中文">中文</option>
-                    <option value="英文">英文</option>
-                    <option value="日文">日文</option>
-                  </select>
-                </label>
-              </div>
-
-              <label class="form-field">
-                <span>书名（可选）</span>
-                <input
-                  v-model="addBookForm.title"
-                  placeholder="允许留空，抓取后自动识别"
-                  type="text"
-                />
-              </label>
-
-              <label class="check-line">
-                <input
-                  v-model="addBookForm.needTranslation"
-                  type="checkbox"
-                />
-                <span>抓取完成后自动进入 AI 翻译流程</span>
-              </label>
-
-              <div class="drawer-actions">
-                <button
-                  class="ghost-btn"
-                  :disabled="loadingPreview"
-                  @click="handlePreview"
-                >
-                  {{ loadingPreview ? '解析中...' : '预览章节' }}
-                </button>
-                <button
-                  class="primary-btn"
-                  :disabled="importing"
-                  @click="handleImport"
-                >
-                  {{ importing ? '导入中...' : '加入书架' }}
-                </button>
-              </div>
-
-              <div class="drawer-actions drawer-actions--local">
-                <button
-                  class="secondary-btn"
-                  :disabled="importing || !localBookFile"
-                  @click="handleImportLocal"
-                >
-                  {{ importing ? '导入中...' : '导入本地文件' }}
-                </button>
-              </div>
-
-              <div class="status-note">
-                <strong>状态</strong>
-                <p>{{ lastMessage }}</p>
-              </div>
-
-              <div
-                v-if="preview"
-                class="preview-panel"
-              >
-                <div class="preview-top">
-                  <div>
-                    <span class="page-kicker">抓取预览</span>
-                    <h4>{{ preview.title }}</h4>
-                  </div>
-                  <strong>{{ preview.bookKind }} · {{ formatChapterCount(preview.chapterCount, preview.bookKind) }}</strong>
-                </div>
-                <p>{{ preview.synopsis }}</p>
-                <ul>
-                  <li
-                    v-for="chapter in preview.chapters.slice(0, 6)"
-                    :key="chapter.url"
-                  >
-                    {{ chapter.title }}
-                    <small v-if="preview.bookKind === '漫画' && chapter.pageCount > 0">（{{ formatPageCount(chapter.pageCount) }}）</small>
-                  </li>
-                </ul>
-              </div>
-            </div>
-          </section>
-        </transition>
-      </template>
-
-      <template v-else-if="currentView === 'logs'">
-        <header class="page-head">
-          <div>
-            <p class="page-kicker">运行面板</p>
-            <h2>运行日志</h2>
-            <p class="page-subtitle">查看导入、下载、翻译和系统状态的完整记录</p>
-          </div>
-          <button
-            class="ghost-btn"
-            type="button"
-            @click="clearActivityLogs"
-          >
-            清空日志
-          </button>
-        </header>
-
-        <section class="summary-row">
-          <article class="summary-card">
-            <span>全部日志</span>
-            <strong>{{ logSummary.total }}</strong>
-            <small>{{ logCardDescription('total') }}</small>
-          </article>
-          <article class="summary-card">
-            <span>系统状态</span>
-            <strong>{{ logSummary.system }}</strong>
-            <small>{{ logCardDescription('system') }}</small>
-          </article>
-          <article class="summary-card">
-            <span>操作记录</span>
-            <strong>{{ logSummary.action }}</strong>
-            <small>{{ logCardDescription('action') }}</small>
-          </article>
-          <article class="summary-card">
-            <span>任务 / 异常</span>
-            <strong>{{ logSummary.task + logSummary.error }}</strong>
-            <small>下载、翻译进度与失败回报</small>
-          </article>
-        </section>
-
-        <section class="logs-page-panel">
-          <div class="chapter-head logs-page-head">
-            <div>
-              <h3>日志流</h3>
-              <p>当前记录 {{ logSummary.total }} 条，下载与翻译任务执行时会自动追加。</p>
-            </div>
-          </div>
-
-          <div
-            v-if="!activityLogs.length"
-            class="status-note flush"
-          >
-            <strong>暂无日志</strong>
-            <p>导入小说、下载章节、翻译任务或系统状态变化后，这里会显示完整记录。</p>
-          </div>
-
-          <div
-            v-else
-            class="logs-page-list"
-          >
-            <article
-              v-for="entry in activityLogs"
-              :key="entry.id"
-              class="logs-page-item"
-              :data-log-category="entry.category"
-            >
-              <div class="logs-page-meta">
-                <span>{{ logCategoryLabel(entry.category) }}</span>
-                <time>{{ entry.at }}</time>
-              </div>
-              <strong>{{ entry.title }}</strong>
-              <p>{{ entry.detail }}</p>
-            </article>
-          </div>
-        </section>
-      </template>
-
-      <template v-else-if="currentView === 'settings'">
-        <header class="page-head narrow">
-          <div>
-            <p class="page-kicker">配置中心</p>
-            <h2>设置</h2>
-            <p class="page-subtitle">配置 AI 翻译服务、漫画站点凭证和应用偏好</p>
-          </div>
-        </header>
-
-        <section class="settings-layout">
-          <article class="settings-card large">
-            <div class="settings-card-head">
-              <div class="settings-badge">⚡</div>
-              <div>
-                <h3>AI 翻译配置</h3>
-                <p>设置用于章节翻译的 AI 服务</p>
-              </div>
-            </div>
-
-            <div class="provider-grid">
-              <button
-                v-for="provider in providerOptions"
-                :key="provider.key"
-                :class="providerCardClass(provider.key)"
-                @click="setDefaultProvider(provider.key)"
-              >
-                <strong>{{ provider.label }}</strong>
-                <span>{{ provider.description }}</span>
-              </button>
-            </div>
-
-            <label class="form-field">
-              <span>API 密钥</span>
-              <input
-                v-model="settings.providers[activeProvider].apiKey"
-                placeholder="sk-..."
-                type="password"
-              />
-              <small>您的 API 密钥将加密保存在本地，不会上传到服务器</small>
-            </label>
-
-            <label class="form-field">
-              <span>API 地址</span>
-              <input
-                v-model="settings.providers[activeProvider].baseUrl"
-                placeholder="https://api.openai.com/v1"
-                type="text"
-              />
-            </label>
-
-            <label class="form-field">
-              <span>翻译模型</span>
-              <input
-                v-model="settings.providers[activeProvider].model"
-                :list="`${activeProvider}-model-options`"
-                placeholder="输入模型名，例如 gpt-5.4"
-                type="text"
-              />
-              <datalist :id="`${activeProvider}-model-options`">
-                <option
-                  v-for="option in providerModelOptions"
-                  :key="option"
-                  :value="option"
-                />
-              </datalist>
-              <small>可直接输入任意模型名，下面的建议项仅用于快速填写。</small>
-            </label>
-
-            <label class="check-line">
-              <input
-                v-model="settings.providers[activeProvider].enabled"
-                type="checkbox"
-              />
-              <span>启用当前提供商</span>
-            </label>
-          </article>
-
-          <article class="settings-card">
-            <h3>应用设置</h3>
-            <label class="form-field">
-              <span>默认翻译服务</span>
-              <select v-model="settings.defaultProvider">
-                <option
-                  v-for="provider in providerOptions"
-                  :key="provider.key"
-                  :value="provider.key"
-                >
-                  {{ provider.label }}
-                </option>
-              </select>
-            </label>
-
-            <label class="form-field">
-              <span>阅读时预翻译后续章节</span>
-              <select v-model.number="settings.autoTranslateNextChapters">
-                <option
-                  v-for="option in autoTranslateOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.label }}
-                </option>
-              </select>
-              <small>打开章节阅读时，会自动把当前章和后续设定章数加入翻译队列；选择“全部剩余章节”会翻译从当前章开始的全部未翻译章节。</small>
-            </label>
-
-            <label class="form-field">
-              <span>下载线程数</span>
-              <input
-                v-model.number="settings.downloadConcurrency"
-                min="1"
-                max="8"
-                step="1"
-                type="number"
-              />
-              <small>用于控制章节与漫画图片下载并发数。建议设置 2-5；18comic / Bika 会自动放大图片并发，过高可能触发目标站点限流。</small>
-            </label>
-
-            <div class="status-note flush">
-              <strong>Bika 漫画凭证</strong>
-              <p>用于抓取 bikawebapp.com 对应的漫画目录和章节图片；留空时会在首次抓取时自动创建并登录本地账户，也支持手动填写已有账户。</p>
-            </div>
-
-            <label class="form-field">
-              <span>Bika 账号</span>
-              <input
-                v-model="settings.bika.email"
-                placeholder="留空则自动创建，或输入已有邮箱/用户名"
-                type="text"
-              />
-            </label>
-
-            <label class="form-field">
-              <span>Bika 密码</span>
-              <input
-                v-model="settings.bika.password"
-                placeholder="留空则自动创建，或输入已有账户密码"
-                type="password"
-              />
-            </label>
-
-            <label class="form-field">
-              <span>系统提示词</span>
-              <textarea
-                v-model="settings.systemPrompt"
-                rows="6"
-              ></textarea>
-            </label>
-
-            <div class="status-note flush">
-              <strong>桌面状态</strong>
-              <p>{{ desktopState }}</p>
-            </div>
-
-            <button
-              class="primary-btn full"
-              :disabled="savingSettings"
-              @click="handleSaveSettings"
-            >
-              {{ savingSettings ? '保存中...' : '保存设置' }}
-            </button>
-          </article>
-        </section>
-      </template>
-
-      <template v-else-if="currentView === 'detail' && selectedBook && selectedPresentation">
-        <header class="detail-back">
-          <button
-            class="text-btn"
-            @click="backToLibrary"
-          >
-            ‹ 返回书架
-          </button>
-        </header>
-
-        <section class="detail-hero">
-          <div
-            class="detail-cover"
-            :class="getCoverClass(selectedBook)"
-          >
-            <img
-              v-if="selectedBook.cover"
-              :src="selectedBook.cover"
-              :alt="`${selectedBook.title} 封面`"
-              class="cover-image"
-            />
-            <div
-              v-if="selectedBook.cover"
-              class="cover-filter"
-            ></div>
-            <div
-              v-else
-              class="cover-glow"
-            ></div>
-            <div class="cover-caption">
-              <span>{{ selectedBook.language }}</span>
-              <strong>{{ selectedBook.title }}</strong>
-            </div>
-            <input
-              :key="coverUploadPickerKey"
-              ref="coverFileInput"
-              class="cover-upload-input"
-              accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
-              type="file"
-              @change="handleCoverFileChange"
-            />
-            <button
-              class="cover-upload-trigger"
-              type="button"
-              :disabled="coverUploading"
-              @click="triggerCoverUpload"
-            >
-              {{ coverUploading ? '上传中...' : '更换封面' }}
-            </button>
-          </div>
-
-          <div class="detail-copy">
-            <h2>{{ selectedBook.title }}</h2>
-            <p class="detail-author">作者：{{ selectedPresentation.author }}</p>
-
-            <div class="book-tags">
-              <span>{{ selectedBook.bookKind }}</span>
-              <span>{{ selectedBook.language }}</span>
-              <span :class="selectedPresentation.accentClass">{{ selectedPresentation.serialState }}</span>
-            </div>
-
-            <div class="detail-stats">
-              <article>
-                <span>{{ selectedBook.bookKind === '漫画' ? '总话数' : '总章节' }}</span>
-                <strong>{{ selectedPresentation.progressTotal }}</strong>
-              </article>
-              <article>
-                <span>阅读进度</span>
-                <strong>
-                  {{
-                    persistedReadingProgress.hasProgress
-                      ? `${persistedReadingProgress.currentIndex} / ${selectedPresentation.progressTotal}`
-                      : '未开始'
-                  }}
-                </strong>
-                <small v-if="persistedReadingProgress.lastReadAt">{{ formatReadingTimestamp(persistedReadingProgress.lastReadAt) }}</small>
-              </article>
-              <article>
-                <span>{{ selectedBook.bookKind === '漫画' ? '总页数' : '总字数' }}</span>
-                <strong>{{ formatContentCount(Number(selectedPresentation.words), selectedBook.bookKind) }}</strong>
-              </article>
-              <article>
-                <span>添加日期</span>
-                <strong>{{ selectedPresentation.addedAt }}</strong>
-              </article>
-            </div>
-
-            <p class="detail-summary">
-              {{ detailSynopsis }}
-            </p>
-
-            <div class="detail-actions">
-              <div class="detail-continue">
-                <button
-                  class="primary-btn"
-                  :disabled="!chapters.length"
-                  @click="handleContinueReading"
-                >
-                  ▶ {{ continueReadingLabel }}
-                </button>
-                <small>{{ continueReadingDescription }}</small>
-              </div>
-              <button
-                class="ghost-btn anchor-btn"
-                :disabled="!selectedBook.sourceUrl"
-                @click="handleOpenExternal(selectedBook.sourceUrl, '原帖')"
-              >
-                ↗ 访问原帖
-              </button>
-              <div class="export-menu">
-                <button
-                  class="ghost-btn"
-                  :disabled="!chapters.length || exportingFormat !== null"
-                  @click="toggleExportMenu"
-                >
-                  {{ exportingFormat ? `${exportingFormat.toUpperCase()} 导出中...` : exportMenuOpen ? '收起导出' : '导出' }}
-                </button>
-                <div
-                  v-if="exportMenuOpen"
-                  class="export-submenu"
-                >
+              <div class="reader-block">
+                <span>字体大小</span>
+                <div class="segmented">
                   <button
-                    class="ghost-btn compact"
-                    :disabled="exportingFormat !== null"
-                    @click="handleExportBook('txt')"
+                    v-for="size in ['小', '中', '大', '特大']"
+                    :key="size"
+                    :class="{ active: readerFontSize === size }"
+                    @click="applyReaderFontSize(size as ReaderFontSize)"
                   >
-                    TXT 文本
+                    {{ size }}
                   </button>
+                </div>
+              </div>
+
+              <div class="reader-block">
+                <span>应用主题</span>
+                <div class="theme-stack">
                   <button
-                    class="ghost-btn compact"
-                    :disabled="exportingFormat !== null"
-                    @click="handleExportBook('epub')"
+                    v-for="theme in themeOptions"
+                    :key="theme.key"
+                    :class="{ active: readerTheme === theme.key }"
+                    @click="applyReaderTheme(theme.key)"
                   >
-                    EPUB 电子书
+                    {{ theme.label }}
+                    <small v-if="readerTheme === theme.key">当前</small>
                   </button>
-                  <span class="export-hint">导出时可自由选择保存位置</span>
                 </div>
               </div>
-              <button
-                class="ghost-btn"
-                :disabled="coverUploading || exportingFormat !== null"
-                @click="triggerCoverUpload"
-              >
-                {{ coverUploading ? '封面上传中...' : '自定义封面' }}
-              </button>
-              <button
-                class="danger-btn"
-                :disabled="deletingBook || exportingFormat !== null"
-                @click="handleDeleteSelectedBook"
-              >
-                {{ deletingBook ? '删除中...' : '删除书籍' }}
-              </button>
-            </div>
-          </div>
-        </section>
 
-        <section class="chapter-card">
-          <div class="chapter-head">
-            <div>
-              <h3>章节列表</h3>
-              <p v-if="detailLoading">正在读取本地章节...</p>
-              <p v-else>
-                已选择 {{ selectedChapterCount }} {{ selectedBook.bookKind === '漫画' ? '话' : '章' }}，共
-                {{ chapters.length }} {{ selectedBook.bookKind === '漫画' ? '话' : '章' }}
-              </p>
-            </div>
-            <div
-              v-if="chapters.length"
-              class="chapter-tools"
-            >
-              <button
-                class="text-btn"
-                @click="toggleAllChapters"
-              >
-                {{ allChaptersSelected ? '取消全选' : '全选' }}
-              </button>
-              <button
-                class="primary-btn soft"
-                :disabled="!chapters.length"
-                @click="handleReadSelectedChapter"
-              >
-                阅读当前章
-              </button>
-              <button
-                class="ghost-btn compact"
-                :disabled="chapterActionLoading === 'translate' || selectedChapterCount === 0"
-                @click="handleDownloadSelected"
-              >
-                {{ chapterActionLoading === 'download' ? '下载中...' : `下载选中 (${selectedChapterCount})` }}
-              </button>
-              <button
-                class="ghost-btn compact"
-                :disabled="chapterActionLoading === 'download' || selectedChapterCount === 0"
-                @click="handleTranslateSelected"
-              >
-                {{ chapterActionLoading === 'translate' ? '翻译中...' : `翻译选中 (${selectedChapterCount})` }}
-              </button>
-              <span class="chapter-inline-note">当前下载线程：{{ settings.downloadConcurrency }}</span>
-            </div>
-          </div>
-
-          <div
-            v-if="detailLoading"
-            class="status-note flush"
-          >
-            <strong>同步中</strong>
-            <p>正在读取本地章节文件和书籍目录清单...</p>
-          </div>
-
-          <div
-            v-else-if="detailError"
-            class="status-note flush"
-          >
-            <strong>加载失败</strong>
-            <p>{{ detailError }}</p>
-            <button
-              class="ghost-btn"
-              @click="selectedBookId && openBook(selectedBookId)"
-            >
-              重新读取
-            </button>
-          </div>
-
-          <div
-            v-else-if="!chapters.length"
-            class="status-note flush"
-          >
-            <strong>暂无章节</strong>
-            <p>当前书籍目录里还没有可读取的章节文件。</p>
-          </div>
-
-          <div
-            v-else
-            class="chapter-list"
-          >
-            <label
-              v-for="chapter in chapters"
-              :key="chapter.id"
-              class="chapter-row"
-              :class="{ active: chapter.index === activeChapterIndex }"
-              @click="setActiveChapter(chapter.index)"
-            >
-              <input
-                v-model="selectedChapterIndexes"
-                :value="chapter.index"
-                type="checkbox"
-                @click.stop
-              />
-              <div class="chapter-copy">
-                <strong>{{ chapter.title }}</strong>
-                <span>{{ formatChapterMeta(chapter, selectedBook.bookKind) }}</span>
-              </div>
-              <div class="chapter-flags">
-                <em v-if="selectedBook.bookKind === '漫画' && chapter.pageCount > 0">{{ formatPageCount(chapter.pageCount) }}</em>
-                <em v-if="chapter.illustration">插图</em>
-                <em v-if="chapter.downloaded">已下载</em>
-                <em v-if="chapter.translated">已翻译</em>
-              </div>
-            </label>
-          </div>
-        </section>
-
-        <section class="chapter-card task-card">
-          <div class="chapter-head">
-            <div>
-              <h3>任务队列</h3>
-              <p v-if="tasksLoading">正在同步任务状态...</p>
-              <p v-else>运行中 {{ activeTasks.length }} 个，失败 {{ failedTasks.length }} 个</p>
-            </div>
-          </div>
-
-          <div
-            v-if="!bookTasks.length"
-            class="status-note flush"
-          >
-            <strong>暂无任务</strong>
-            <p>下载和翻译任务会显示在这里，并持续更新进度。</p>
-          </div>
-
-          <div
-            v-else
-            class="task-list"
-          >
-            <article
-              v-for="task in bookTasks"
-              :key="task.id"
-              class="task-row"
-            >
-              <div class="task-copy">
-                <div class="task-meta">
-                  <strong>{{ taskTypeLabel(task) }}</strong>
-                  <span :data-task-status="task.status">{{ taskStatusLabel(task.status) }}</span>
-                </div>
-                <p>{{ task.message || '等待任务状态更新' }}</p>
-                <small>章节 {{ task.completedCount }} / {{ task.totalCount }}</small>
-                <small v-if="task.error">{{ task.error }}</small>
-              </div>
-
-              <div class="task-side">
-                <div class="task-progress">
-                  <div
-                    class="task-progress-fill"
-                    :style="{ width: `${task.progress}%` }"
-                  ></div>
-                </div>
-                <button
-                  v-if="task.status === 'failed'"
-                  class="ghost-btn compact"
-                  :disabled="taskRetryingId === task.id"
-                  @click="handleRetryTask(task.id)"
-                >
-                  {{ taskRetryingId === task.id ? '重试中...' : '失败重试' }}
-                </button>
-              </div>
-            </article>
-          </div>
-        </section>
-      </template>
-
-      <template v-else-if="currentView === 'reader' && selectedBook && selectedPresentation">
-        <header class="reader-topbar">
-          <button
-            class="text-btn"
-            @click="backToDetail"
-          >
-            ‹ 返回
-          </button>
-
-          <div class="reader-title">
-            <strong>{{ selectedBook.title }}</strong>
-            <span>{{ readerChapter?.title || '未选择章节' }}</span>
-          </div>
-
-          <div class="reader-tools">
-            <button
-              class="ghost-btn compact"
-              :disabled="!readerSourceUrl"
-              @click="handleOpenExternal(readerSourceUrl, '章节原帖')"
-            >
-              原帖
-            </button>
-            <button
-              class="ghost-btn compact"
-              :disabled="!chapters.length"
-              @click="readerChapterPickerOpen = !readerChapterPickerOpen"
-            >
-              {{ readerChapterPickerOpen ? '收起章节' : '章节选择' }}
-            </button>
-            <button
-              class="ghost-btn compact"
-              :disabled="!translatedReadable"
-              @click="toggleReaderMode"
-            >
-              {{ readerMode === 'translated' ? (isComicBook ? '原图' : '原文') : '译文' }}
-            </button>
-            <button
-              class="ghost-btn compact"
-              :disabled="!hasPreviousChapter"
-              @click="goToAdjacentChapter(-1)"
-            >
-              {{ isComicBook ? '上一话' : '上一章' }}
-            </button>
-            <button
-              class="ghost-btn compact"
-              :disabled="!hasNextChapter"
-              @click="goToAdjacentChapter(1)"
-            >
-              {{ isComicBook ? '下一话' : '下一章' }}
-            </button>
-            <button
-              class="icon-btn"
-              @click="showReaderPanel = !showReaderPanel"
-            >
-              ⚙
-            </button>
-          </div>
-        </header>
-
-        <div class="reader-progress">
-          <span>{{ isComicBook ? '话数' : '章节' }} {{ readerProgressIndex }} / {{ readerProgressTotal }}</span>
-          <span>{{ formatContentCount(readerWordCount, selectedBook.bookKind) }}</span>
-          <div class="reader-line">
-            <div
-              class="reader-line-fill"
-              :style="{ width: `${readerProgressTotal ? (readerProgressIndex / readerProgressTotal) * 100 : 0}%` }"
-            ></div>
-          </div>
-        </div>
-
-        <transition name="panel-fade">
-          <section
-            v-if="readerChapterPickerOpen"
-            class="reader-chapter-picker"
-          >
-            <div class="reader-chapter-picker-head">
-              <div>
-                <strong>章节选择</strong>
-                <p>{{ readerChapterPickerSummary }}</p>
-              </div>
-              <button
-                class="ghost-btn compact"
-                @click="readerChapterPickerOpen = false"
-              >
-                收起
-              </button>
-            </div>
-            <div class="reader-chapter-picker-list">
-              <button
-                v-for="chapter in chapters"
-                :key="chapter.id"
-                class="reader-chapter-chip"
-                :class="{
-                  active: chapter.index === activeChapterIndex,
-                  progress: persistedReadingProgress.currentIndex > 0 && chapter.index === persistedReadingProgress.currentIndex,
-                }"
-                @click="selectReaderChapter(chapter.index)"
-              >
-                <span>{{ chapter.title || formatChapterOrder(chapter.index, selectedBook.bookKind) }}</span>
-                <small>{{ formatChapterMeta(chapter, selectedBook.bookKind) }}</small>
-              </button>
-            </div>
-          </section>
-        </transition>
-
-        <section
-          class="reader-layout"
-          :class="{ 'reader-layout--focus': !showReaderPanel }"
-        >
-          <article
-            ref="readerPaperRef"
-            class="reader-paper"
-          >
-            <template v-if="readerLoading">
-              <h2>{{ readerChapter?.title || '正在加载章节' }}</h2>
-              <p>正在从本地章节文件读取正文...</p>
-            </template>
-
-            <template v-else-if="readerError">
-              <h2>{{ readerChapter?.title || '章节加载失败' }}</h2>
-              <p>{{ readerError }}</p>
-            </template>
-
-            <template v-else-if="readerContent">
-              <h2>{{ readerContent.chapter.title }}</h2>
-              <div
-                v-if="readerImages.length"
-                class="reader-illustrations"
-              >
-                <figure
-                  v-for="(imageSource, index) in readerImages"
-                  :key="`${readerContent.chapter.id}-image-${index}`"
-                  class="reader-figure"
-                  data-reader-anchor-type="image"
-                  :data-reader-anchor-index="index"
-                >
-                  <img
-                    :src="imageSource"
-                    :alt="`${readerContent.chapter.title} 插图 ${index + 1}`"
-                    @load="handleReaderAssetLoad"
-                    @error="handleReaderAssetLoad"
-                  />
-                  <figcaption>{{ isComicBook ? `第 ${index + 1} 页` : `插图 ${index + 1}` }}</figcaption>
-                  <div
-                    v-if="isComicBook && readerMode === 'translated' && !readerUsesTranslatedImages && readerPageTranslations[index]"
-                    class="reader-page-translation"
+              <div class="reader-block">
+                <div class="reader-color-head">
+                  <span>自定义颜色</span>
+                  <button
+                    class="text-btn"
+                    type="button"
+                    @click="resetReaderColors"
                   >
-                    <strong>本页译文</strong>
-                    <p class="reader-page-translation-text">{{ readerPageTranslations[index] }}</p>
-                  </div>
-                </figure>
+                    恢复主题
+                  </button>
+                </div>
+                <div class="reader-color-grid">
+                  <label class="reader-color-field">
+                    <small>字体颜色</small>
+                    <div class="reader-color-input">
+                      <input
+                        :value="readerTextColor || '#111827'"
+                        type="color"
+                        @input="applyReaderTextColor(($event.target as HTMLInputElement).value)"
+                      />
+                      <input
+                        :value="readerTextColor"
+                        placeholder="跟随主题"
+                        type="text"
+                        @input="applyReaderTextColor(($event.target as HTMLInputElement).value)"
+                      />
+                    </div>
+                  </label>
+                  <label class="reader-color-field">
+                    <small>背景颜色</small>
+                    <div class="reader-color-input">
+                      <input
+                        :value="readerBackgroundColor || '#ffffff'"
+                        type="color"
+                        @input="applyReaderBackgroundColor(($event.target as HTMLInputElement).value)"
+                      />
+                      <input
+                        :value="readerBackgroundColor"
+                        placeholder="跟随主题"
+                        type="text"
+                        @input="applyReaderBackgroundColor(($event.target as HTMLInputElement).value)"
+                      />
+                    </div>
+                  </label>
+                </div>
               </div>
-              <template v-if="!isComicBook">
-                <p
-                  v-for="(paragraph, index) in visibleReaderParagraphs"
-                  :key="`${readerContent.chapter.id}-${index}`"
-                  data-reader-anchor-type="paragraph"
-                  :data-reader-anchor-index="index"
-                >
-                  {{ paragraph }}
-                </p>
-              </template>
-              <div
-                v-else-if="readerMode === 'translated' && !readerUsesTranslatedImages && !readerPageTranslations.length && visibleReaderParagraphs.length"
-                class="reader-comic-fallback"
-              >
-                <strong>整话译文</strong>
-                <p
-                  v-for="(paragraph, index) in visibleReaderParagraphs"
-                  :key="`${readerContent.chapter.id}-fallback-${index}`"
-                  data-reader-anchor-type="paragraph"
-                  :data-reader-anchor-index="index"
-                >
-                  {{ paragraph }}
-                </p>
+
+              <div class="preview-sample">
+                <strong>示例文本</strong>
+                <p>这是当前字体大小和主题的预览效果，适合长时间沉浸阅读。</p>
+                <span>{{ readerThemeLabel }} · {{ readerFontSize }}</span>
+                <span>{{ readerColorSummary }}</span>
               </div>
-            </template>
-
-            <template v-else>
-              <h2>{{ readerChapter?.title || '暂无章节' }}</h2>
-              <p>当前没有可读取的章节内容。</p>
-            </template>
-          </article>
-
-          <aside
-            v-if="showReaderPanel"
-            class="reader-panel"
-          >
-            <div class="reader-panel-head">
-              <h3>阅读设置</h3>
-              <button
-                class="icon-btn"
-                @click="showReaderPanel = false"
-              >
-                ×
-              </button>
-            </div>
-
-            <div class="reader-block">
-              <span>字体大小</span>
-              <div class="segmented">
-                <button
-                  v-for="size in ['小', '中', '大', '特大']"
-                  :key="size"
-                  :class="{ active: readerFontSize === size }"
-                  @click="applyReaderFontSize(size as ReaderFontSize)"
-                >
-                  {{ size }}
-                </button>
-              </div>
-            </div>
-
-            <div class="reader-block">
-              <span>应用主题</span>
-              <div class="theme-stack">
-                <button
-                  v-for="theme in themeOptions"
-                  :key="theme.key"
-                  :class="{ active: readerTheme === theme.key }"
-                  @click="applyReaderTheme(theme.key)"
-                >
-                  {{ theme.label }}
-                  <small v-if="readerTheme === theme.key">当前</small>
-                </button>
-              </div>
-            </div>
-
-            <div class="reader-block">
-              <div class="reader-color-head">
-                <span>自定义颜色</span>
-                <button
-                  class="text-btn"
-                  type="button"
-                  @click="resetReaderColors"
-                >
-                  恢复主题
-                </button>
-              </div>
-              <div class="reader-color-grid">
-                <label class="reader-color-field">
-                  <small>字体颜色</small>
-                  <div class="reader-color-input">
-                    <input
-                      :value="readerTextColor || '#111827'"
-                      type="color"
-                      @input="applyReaderTextColor(($event.target as HTMLInputElement).value)"
-                    />
-                    <input
-                      :value="readerTextColor"
-                      placeholder="跟随主题"
-                      type="text"
-                      @input="applyReaderTextColor(($event.target as HTMLInputElement).value)"
-                    />
-                  </div>
-                </label>
-                <label class="reader-color-field">
-                  <small>背景颜色</small>
-                  <div class="reader-color-input">
-                    <input
-                      :value="readerBackgroundColor || '#ffffff'"
-                      type="color"
-                      @input="applyReaderBackgroundColor(($event.target as HTMLInputElement).value)"
-                    />
-                    <input
-                      :value="readerBackgroundColor"
-                      placeholder="跟随主题"
-                      type="text"
-                      @input="applyReaderBackgroundColor(($event.target as HTMLInputElement).value)"
-                    />
-                  </div>
-                </label>
-              </div>
-            </div>
-
-            <div class="preview-sample">
-              <strong>示例文本</strong>
-              <p>这是当前字体大小和主题的预览效果，适合长时间沉浸阅读。</p>
-              <span>{{ readerThemeLabel }} · {{ readerFontSize }}</span>
-              <span>{{ readerColorSummary }}</span>
-            </div>
-          </aside>
+            </aside>
+          </section>
         </section>
       </template>
     </section>
