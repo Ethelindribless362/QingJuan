@@ -162,7 +162,7 @@ const desktopState = ref('正在准备桌面后端...');
 const lastMessage = ref('等待输入小说链接');
 const loadingPreview = ref(false);
 const importing = ref(false);
-const localBookFile = ref<File | null>(null);
+const localBookFiles = ref<File[]>([]);
 const localFilePickerKey = ref(0);
 const coverUploadPickerKey = ref(0);
 const coverFileInput = ref<HTMLInputElement | null>(null);
@@ -1239,7 +1239,7 @@ async function handleImport() {
     lastMessage.value = `《${book.title}》已进入文库`;
     showImportPanel.value = false;
     preview.value = null;
-    localBookFile.value = null;
+    localBookFiles.value = [];
     resetAddBookForm();
   } catch (error) {
     lastMessage.value = `导入失败：${toErrorMessage(error)}`;
@@ -1250,40 +1250,86 @@ async function handleImport() {
 
 function handleLocalFileChange(event: Event) {
   const input = event.target as HTMLInputElement | null;
-  localBookFile.value = input?.files?.[0] ?? null;
-  if (localBookFile.value) {
+  localBookFiles.value = Array.from(input?.files ?? []).filter((file) => /\.(txt|text)$/i.test(file.name));
+  if (localBookFiles.value.length) {
     preview.value = null;
-    lastMessage.value = `已选择本地文件：${localBookFile.value.name}`;
+    const fileLabel = localBookFiles.value.length === 1
+      ? localBookFiles.value[0].name
+      : `${localBookFiles.value.length} 个 TXT 文件`;
+    lastMessage.value = `已选择本地文件：${fileLabel}`;
+  } else if (input?.files?.length) {
+    lastMessage.value = '仅支持批量导入 TXT / TEXT 文件';
   }
 }
 
 async function handleImportLocal() {
-  if (!localBookFile.value) {
-    lastMessage.value = '请先选择本地 TXT 文件';
+  if (!localBookFiles.value.length) {
+    lastMessage.value = '请先选择至少一个本地 TXT 文件';
     return;
   }
 
+  const files = [...localBookFiles.value];
+  const importedBooks: BookRecord[] = [];
+  const failedFiles: Array<{ file: File; reason: string }> = [];
+  const customTitle = files.length === 1 ? addBookForm.title : '';
+
   importing.value = true;
-  lastMessage.value = `正在导入本地文件：${localBookFile.value.name}`;
+  lastMessage.value = `正在批量导入本地文件（1 / ${files.length}）：${files[0].name}`;
 
   try {
-    const book = await importLocalBook(localBookFile.value, {
-      bookKind: addBookForm.bookKind,
-      title: addBookForm.title,
-      language: addBookForm.language,
-      needTranslation: addBookForm.needTranslation,
-    });
-    updateBookCache(book);
-    selectedBookId.value = book.id;
-    await loadBookDetail(book.id);
-    currentView.value = 'detail';
-    lastMessage.value = `《${book.title}》已从本地文件导入`;
-    showImportPanel.value = false;
+    for (const [index, file] of files.entries()) {
+      lastMessage.value = `正在批量导入本地文件（${index + 1} / ${files.length}）：${file.name}`;
+
+      try {
+        const book = await importLocalBook(file, {
+          bookKind: addBookForm.bookKind,
+          title: customTitle,
+          language: addBookForm.language,
+          needTranslation: addBookForm.needTranslation,
+        });
+        importedBooks.push(book);
+        updateBookCache(book);
+      } catch (error) {
+        failedFiles.push({
+          file,
+          reason: toErrorMessage(error),
+        });
+      }
+    }
+
+    if (!importedBooks.length) {
+      localBookFiles.value = failedFiles.map((item) => item.file);
+      localFilePickerKey.value += 1;
+      lastMessage.value = failedFiles.length === 1
+        ? `《${failedFiles[0].file.name}》导入失败：${failedFiles[0].reason}`
+        : `${failedFiles.length} 个本地文件导入失败，请检查编码或内容格式后重试`;
+      return;
+    }
+
+    const latestBook = importedBooks[importedBooks.length - 1];
+    selectedBookId.value = latestBook.id;
+
+    if (importedBooks.length === 1 && !failedFiles.length) {
+      await loadBookDetail(latestBook.id);
+      currentView.value = 'detail';
+      lastMessage.value = `《${latestBook.title}》已从本地文件导入`;
+    } else {
+      currentView.value = 'library';
+      lastMessage.value = failedFiles.length
+        ? `批量导入完成：成功 ${importedBooks.length} 本，失败 ${failedFiles.length} 本`
+        : `批量导入完成：成功导入 ${importedBooks.length} 本小说`;
+    }
+
     preview.value = null;
-    localBookFile.value = null;
+
+    if (failedFiles.length) {
+      localBookFiles.value = failedFiles.map((item) => item.file);
+      localFilePickerKey.value += 1;
+      return;
+    }
+
+    showImportPanel.value = false;
     resetAddBookForm();
-  } catch (error) {
-    lastMessage.value = `本地导入失败：${toErrorMessage(error)}`;
   } finally {
     importing.value = false;
   }
@@ -1368,7 +1414,7 @@ function resetAddBookForm() {
   addBookForm.bookKind = '长小说';
   addBookForm.language = '中文';
   addBookForm.needTranslation = false;
-  localBookFile.value = null;
+  localBookFiles.value = [];
   localFilePickerKey.value += 1;
 }
 
@@ -2802,19 +2848,26 @@ onBeforeUnmount(() => {
                   <span>本地小说文件</span>
                   <input
                     :key="localFilePickerKey"
-                    accept=".txt,.text,.md"
+                    accept=".txt,.text"
+                    multiple
                     type="file"
                     @change="handleLocalFileChange"
                   />
                   <small class="field-hint">
-                    支持导入本地 TXT / TEXT / Markdown 文本，系统会自动尝试拆分章节。
+                    支持多选并批量导入本地 TXT / TEXT 文本，系统会自动尝试拆分章节。
                   </small>
                   <strong
-                    v-if="localBookFile"
+                    v-if="localBookFiles.length"
                     class="file-picked"
                   >
-                    已选择：{{ localBookFile.name }}
+                    已选择 {{ localBookFiles.length }} 个文件：{{ localBookFiles.slice(0, 3).map((file) => file.name).join('、') }}<template v-if="localBookFiles.length > 3"> 等 {{ localBookFiles.length }} 个</template>
                   </strong>
+                  <small
+                    v-if="localBookFiles.length > 1 && addBookForm.title.trim()"
+                    class="field-hint"
+                  >
+                    批量导入时将自动使用各文件名作为书名，单个书名输入不会覆盖全部文件。
+                  </small>
                 </label>
 
                 <div class="field-grid">
@@ -2875,10 +2928,10 @@ onBeforeUnmount(() => {
                 <div class="drawer-actions drawer-actions--local">
                   <button
                     class="secondary-btn"
-                    :disabled="importing || !localBookFile"
+                    :disabled="importing || !localBookFiles.length"
                     @click="handleImportLocal"
                   >
-                    {{ importing ? '导入中...' : '导入本地文件' }}
+                    {{ importing ? '导入中...' : `导入本地文件${localBookFiles.length > 1 ? `（${localBookFiles.length}）` : ''}` }}
                   </button>
                 </div>
 
